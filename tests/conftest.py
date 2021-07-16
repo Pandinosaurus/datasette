@@ -61,13 +61,18 @@ def move_to_front(items, test_name):
 
 @pytest.fixture
 def restore_working_directory(tmpdir, request):
-    previous_cwd = os.getcwd()
+    try:
+        previous_cwd = os.getcwd()
+    except OSError:
+        # https://github.com/simonw/datasette/issues/1361
+        previous_cwd = None
     tmpdir.chdir()
 
     def return_to_previous():
         os.chdir(previous_cwd)
 
-    request.addfinalizer(return_to_previous)
+    if previous_cwd is not None:
+        request.addfinalizer(return_to_previous)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -126,7 +131,6 @@ def ds_localhost_https_server(tmp_path_factory):
     for blob in server_cert.cert_chain_pems:
         blob.write_to_path(path=certfile, append=True)
     ca.cert_pem.write_to_path(path=client_cert)
-
     ds_proc = subprocess.Popen(
         [
             "datasette",
@@ -147,5 +151,24 @@ def ds_localhost_https_server(tmp_path_factory):
     # Check it started successfully
     assert not ds_proc.poll(), ds_proc.stdout.read().decode("utf-8")
     yield ds_proc, client_cert
+    # Shut it down at the end of the pytest session
+    ds_proc.terminate()
+
+
+@pytest.fixture(scope="session")
+def ds_unix_domain_socket_server(tmp_path_factory):
+    socket_folder = tmp_path_factory.mktemp("uds")
+    uds = str(socket_folder / "datasette.sock")
+    ds_proc = subprocess.Popen(
+        ["datasette", "--memory", "--uds", uds],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=tempfile.gettempdir(),
+    )
+    # Give the server time to start
+    time.sleep(1.5)
+    # Check it started successfully
+    assert not ds_proc.poll(), ds_proc.stdout.read().decode("utf-8")
+    yield ds_proc, uds
     # Shut it down at the end of the pytest session
     ds_proc.terminate()

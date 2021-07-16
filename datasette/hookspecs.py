@@ -11,6 +11,11 @@ def startup(datasette):
 
 
 @hookspec
+def get_metadata(datasette, key, database, table):
+    """Return metadata to be merged into Datasette's metadata dictionary"""
+
+
+@hookspec
 def asgi_wrapper(datasette):
     """Returns an ASGI middleware callable to wrap our ASGI application with"""
 
@@ -100,15 +105,20 @@ def forbidden(datasette, request, message):
 
 
 @hookspec
-def menu_links(datasette, actor):
+def menu_links(datasette, actor, request):
     """Links for the navigation menu"""
 
 
 @hookspec
-def table_actions(datasette, actor, database, table):
+def table_actions(datasette, actor, database, table, request):
     """Links for the table actions menu"""
 
 
 @hookspec
-def database_actions(datasette, actor, database):
+def database_actions(datasette, actor, database, request):
     """Links for the database actions menu"""
+
+
+@hookspec
+def skip_csrf(datasette, scope):
+    """Mechanism for skipping CSRF checks for certain requests"""

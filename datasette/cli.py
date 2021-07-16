@@ -334,6 +334,10 @@ def uninstall(packages, yes):
     help="Port for server, defaults to 8001. Use -p 0 to automatically assign an available port.",
 )
 @click.option(
+    "--uds",
+    help="Bind to a Unix domain socket",
+)
+@click.option(
     "--reload",
     is_flag=True,
     help="Automatically reload if code or metadata change detected - useful for development",
@@ -428,6 +432,7 @@ def serve(
     immutable,
     host,
     port,
+    uds,
     reload,
     cors,
     sqlite_extensions,
@@ -540,7 +545,7 @@ def serve(
     # Run the "startup" plugin hooks
     asyncio.get_event_loop().run_until_complete(ds.invoke_startup())
 
-    # Run async sanity checks - but only if we're not under pytest
+    # Run async soundness checks - but only if we're not under pytest
     asyncio.get_event_loop().run_until_complete(check_databases(ds))
 
     if get:
@@ -569,6 +574,8 @@ def serve(
     uvicorn_kwargs = dict(
         host=host, port=port, log_level="info", lifespan="on", workers=1
     )
+    if uds:
+        uvicorn_kwargs["uds"] = uds
     if ssl_keyfile:
         uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
     if ssl_certfile:

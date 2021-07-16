@@ -5,8 +5,8 @@ from collections import OrderedDict, namedtuple, Counter
 import base64
 import hashlib
 import inspect
-import itertools
 import json
+import markupsafe
 import mergedeep
 import os
 import re
@@ -16,11 +16,9 @@ import time
 import types
 import shutil
 import urllib
-import numbers
 import yaml
 from .shutil_backport import copytree
-from .sqlite import sqlite3, sqlite_version, supports_table_xinfo
-from ..plugins import pm
+from .sqlite import sqlite3, supports_table_xinfo
 
 
 # From https://www.sqlite.org/lang_keywords.html
@@ -546,7 +544,7 @@ def detect_fts_sql(table):
                 )
             )
     """.format(
-        table=table
+        table=table.replace("'", "''")
     )
 
 
@@ -775,6 +773,14 @@ class LimitedWriter:
         if self.limit_bytes and (self.bytes_count > self.limit_bytes):
             raise WriteLimitExceeded(f"CSV contains more than {self.limit_bytes} bytes")
         await self.writer.write(bytes)
+
+
+class EscapeHtmlWriter:
+    def __init__(self, writer):
+        self.writer = writer
+
+    async def write(self, content):
+        await self.writer.write(markupsafe.escape(content))
 
 
 _infinities = {float("inf"), float("-inf")}

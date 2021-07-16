@@ -1,5 +1,5 @@
 from datasette.app import Datasette
-from datasette.utils.sqlite import sqlite3, sqlite_version, supports_generated_columns
+from datasette.utils.sqlite import sqlite3, sqlite_version
 from datasette.utils.testing import TestClient
 import click
 import contextlib
@@ -52,6 +52,7 @@ EXPECTED_PLUGINS = [
             "register_magic_parameters",
             "register_routes",
             "render_cell",
+            "skip_csrf",
             "startup",
             "table_actions",
         ],
@@ -117,8 +118,6 @@ def make_app_client(
             immutables = []
         conn = sqlite3.connect(filepath)
         conn.executescript(TABLES)
-        if supports_generated_columns():
-            conn.executescript(GENERATED_COLUMNS_SQL)
         for sql, params in TABLE_PARAMETERIZED_SQL:
             with conn:
                 conn.execute(sql, params)
@@ -126,19 +125,20 @@ def make_app_client(
             for extra_filename, extra_sql in extra_databases.items():
                 extra_filepath = os.path.join(tmpdir, extra_filename)
                 sqlite3.connect(extra_filepath).executescript(extra_sql)
-                files.append(extra_filepath)
+                # Insert at start to help test /-/databases ordering:
+                files.insert(0, extra_filepath)
         os.chdir(os.path.dirname(filepath))
         config = config or {}
-        config.update(
-            {
-                "default_page_size": 50,
-                "max_returned_rows": max_returned_rows or 100,
-                "sql_time_limit_ms": sql_time_limit_ms or 200,
-                # Default is 3 but this results in "too many open files"
-                # errors when running the full test suite:
-                "num_sql_threads": 1,
-            }
-        )
+        for key, value in {
+            "default_page_size": 50,
+            "max_returned_rows": max_returned_rows or 100,
+            "sql_time_limit_ms": sql_time_limit_ms or 200,
+            # Default is 3 but this results in "too many open files"
+            # errors when running the full test suite:
+            "num_sql_threads": 1,
+        }.items():
+            if key not in config:
+                config[key] = value
         ds = Datasette(
             files,
             immutables=immutables,
@@ -210,6 +210,12 @@ def app_client_two_attached_databases_one_immutable():
 @pytest.fixture(scope="session")
 def app_client_with_hash():
     with make_app_client(config={"hash_urls": True}, is_immutable=True) as client:
+        yield client
+
+
+@pytest.fixture(scope="session")
+def app_client_with_trace():
+    with make_app_client(config={"trace_debug": True}, is_immutable=True) as client:
         yield client
 
 
@@ -712,18 +718,6 @@ INSERT INTO "searchable_fts" (rowid, text1, text2)
     SELECT rowid, text1, text2 FROM searchable;
 """
 
-GENERATED_COLUMNS_SQL = """
-CREATE TABLE generated_columns (
-    body TEXT,
-    id INT GENERATED ALWAYS AS (json_extract(body, '$.number')) STORED,
-    consideration INT GENERATED ALWAYS AS (json_extract(body, '$.string')) STORED
-);
-INSERT INTO generated_columns (body) VALUES ('{
-    "number": 1,
-    "string": "This is a string"
-}');
-"""
-
 
 def assert_permissions_checked(datasette, actions):
     # actions is a list of "action" or (action, resource) tuples
@@ -784,9 +778,6 @@ def cli(db_filename, metadata, plugins_path, recreate, extra_db_filename):
     for sql, params in TABLE_PARAMETERIZED_SQL:
         with conn:
             conn.execute(sql, params)
-    if supports_generated_columns():
-        with conn:
-            conn.executescript(GENERATED_COLUMNS_SQL)
     print(f"Test tables written to {db_filename}")
     if metadata:
         with open(metadata, "w") as fp:

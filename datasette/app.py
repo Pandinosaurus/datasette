@@ -19,10 +19,9 @@ import urllib.parse
 from concurrent import futures
 from pathlib import Path
 
-from markupsafe import Markup
+from markupsafe import Markup, escape
 from itsdangerous import URLSafeSerializer
-import jinja2
-from jinja2 import ChoiceLoader, Environment, FileSystemLoader, PrefixLoader, escape
+from jinja2 import ChoiceLoader, Environment, FileSystemLoader, PrefixLoader
 from jinja2.environment import Template
 from jinja2.exceptions import TemplateNotFound
 import uvicorn
@@ -59,7 +58,6 @@ from .utils import (
     parse_metadata,
     resolve_env_secrets,
     to_css_class,
-    HASH_LENGTH,
 )
 from .utils.asgi import (
     AsgiLifespan,
@@ -163,6 +161,11 @@ SETTINGS = (
         False,
         "Allow display of template debug information with ?_context=1",
     ),
+    Setting(
+        "trace_debug",
+        False,
+        "Allow display of SQL trace debug information with ?_trace=1",
+    ),
     Setting("base_url", "/", "Datasette URLs should use this base path"),
 )
 
@@ -221,6 +224,7 @@ class Datasette:
         self.inspect_data = inspect_data
         self.immutables = set(immutables or [])
         self.databases = collections.OrderedDict()
+        self._refresh_schemas_lock = asyncio.Lock()
         self.crossdb = crossdb
         if memory or crossdb or not self.files:
             self.add_database(Database(self, is_memory=True), name="_memory")
@@ -247,7 +251,7 @@ class Datasette:
         if config_dir and metadata_files and not metadata:
             with metadata_files[0].open() as fp:
                 metadata = parse_metadata(fp.read())
-        self._metadata = metadata or {}
+        self._metadata_local = metadata or {}
         self.sqlite_functions = []
         self.sqlite_extensions = []
         for extension in sqlite_extensions or []:
@@ -329,6 +333,12 @@ class Datasette:
         self.client = DatasetteClient(self)
 
     async def refresh_schemas(self):
+        if self._refresh_schemas_lock.locked():
+            return
+        async with self._refresh_schemas_lock:
+            await self._refresh_schemas()
+
+    async def _refresh_schemas(self):
         internal_db = self.databases["_internal"]
         if not self.internal_db_created:
             await init_internal_db(internal_db)
@@ -350,7 +360,7 @@ class Datasette:
                 INSERT OR REPLACE INTO databases (database_name, path, is_memory, schema_version)
                 VALUES (?, ?, ?, ?)
             """,
-                [database_name, db.path, db.is_memory, schema_version],
+                [database_name, str(db.path), db.is_memory, schema_version],
                 block=True,
             )
             await populate_schema_tables(internal_db, db)
@@ -376,6 +386,7 @@ class Datasette:
         return self.databases[name]
 
     def add_database(self, db, name=None):
+        new_databases = self.databases.copy()
         if name is None:
             # Pick a unique name for this database
             suggestion = db.suggest_name()
@@ -387,14 +398,18 @@ class Datasette:
             name = "{}_{}".format(suggestion, i)
             i += 1
         db.name = name
-        self.databases[name] = db
+        new_databases[name] = db
+        # don't mutate! that causes race conditions with live import
+        self.databases = new_databases
         return db
 
     def add_memory_database(self, memory_name):
         return self.add_database(Database(self, memory_name=memory_name))
 
     def remove_database(self, name):
-        self.databases.pop(name)
+        new_databases = self.databases.copy()
+        new_databases.pop(name)
+        self.databases = new_databases
 
     def setting(self, key):
         return self._settings.get(key, None)
@@ -402,6 +417,17 @@ class Datasette:
     def config_dict(self):
         # Returns a fully resolved config dictionary, useful for templates
         return {option.name: self.setting(option.name) for option in SETTINGS}
+
+    def _metadata_recursive_update(self, orig, updated):
+        if not isinstance(orig, dict) or not isinstance(updated, dict):
+            return orig
+
+        for key, upd_value in updated.items():
+            if isinstance(upd_value, dict) and isinstance(orig.get(key), dict):
+                orig[key] = self._metadata_recursive_update(orig[key], upd_value)
+            else:
+                orig[key] = upd_value
+        return orig
 
     def metadata(self, key=None, database=None, table=None, fallback=True):
         """
@@ -411,7 +437,21 @@ class Datasette:
         assert not (
             database is None and table is not None
         ), "Cannot call metadata() with table= specified but not database="
-        databases = self._metadata.get("databases") or {}
+        metadata = {}
+
+        for hook_dbs in pm.hook.get_metadata(
+            datasette=self, key=key, database=database, table=table
+        ):
+            metadata = self._metadata_recursive_update(metadata, hook_dbs)
+
+        # security precaution!! don't allow anything in the local config
+        # to be overwritten. this is a temporary measure, not sure if this
+        # is a good idea long term or maybe if it should just be a concern
+        # of the plugin's implemtnation
+        metadata = self._metadata_recursive_update(metadata, self._metadata_local)
+
+        databases = metadata.get("databases") or {}
+
         search_list = []
         if database is not None:
             search_list.append(databases.get(database) or {})
@@ -420,7 +460,8 @@ class Datasette:
                 table
             ) or {}
             search_list.insert(0, table_metadata)
-        search_list.append(self._metadata)
+
+        search_list.append(metadata)
         if not fallback:
             # No fallback allowed, so just use the first one in the list
             search_list = search_list[:1]
@@ -435,6 +476,10 @@ class Datasette:
             for item in search_list:
                 m.update(item)
             return m
+
+    @property
+    def _metadata(self):
+        return self.metadata()
 
     def plugin_config(self, plugin_name, database=None, table=None, fallback=True):
         """Return config for plugin, falling back from specified database/table"""
@@ -647,7 +692,7 @@ class Datasette:
                 "is_memory": d.is_memory,
                 "hash": d.hash,
             }
-            for name, d in sorted(self.databases.items(), key=lambda p: p[1].name)
+            for name, d in self.databases.items()
             if name != "_internal"
         ]
 
@@ -829,7 +874,9 @@ class Datasette:
         async def menu_links():
             links = []
             for hook in pm.hook.menu_links(
-                datasette=self, actor=request.actor if request else None
+                datasette=self,
+                actor=request.actor if request else None,
+                request=request or None,
             ):
                 extra_links = await await_me_maybe(hook)
                 if extra_links:
@@ -864,7 +911,7 @@ class Datasette:
         }
         if request and request.args.get("_context") and self.setting("template_debug"):
             return "<pre>{}</pre>".format(
-                jinja2.escape(json.dumps(template_context, default=repr, indent=4))
+                escape(json.dumps(template_context, default=repr, indent=4))
             )
 
         return await template.render_async(template_context)
@@ -954,7 +1001,7 @@ class Datasette:
             r"/:memory:(?P<rest>.*)$",
         )
         add_route(
-            JsonDataView.as_view(self, "metadata.json", lambda: self._metadata),
+            JsonDataView.as_view(self, "metadata.json", lambda: self.metadata()),
             r"/-/metadata(?P<as_format>(\.json)?)$",
         )
         add_route(
@@ -1042,14 +1089,18 @@ class Datasette:
                 if not database.is_mutable:
                     await database.table_counts(limit=60 * 60 * 1000)
 
-        asgi = AsgiLifespan(
-            AsgiTracer(
-                asgi_csrf.asgi_csrf(
-                    DatasetteRouter(self, routes),
-                    signing_secret=self._secret,
-                    cookie_name="ds_csrftoken",
-                )
+        asgi = asgi_csrf.asgi_csrf(
+            DatasetteRouter(self, routes),
+            signing_secret=self._secret,
+            cookie_name="ds_csrftoken",
+            skip_if_scope=lambda scope: any(
+                pm.hook.skip_csrf(datasette=self, scope=scope)
             ),
+        )
+        if self.setting("trace_debug"):
+            asgi = AsgiTracer(asgi)
+        asgi = AsgiLifespan(
+            asgi,
             on_startup=setup_db,
         )
         for wrapper in pm.hook.asgi_wrapper(datasette=self):
@@ -1090,6 +1141,7 @@ class DatasetteRouter:
         base_url = self.ds.setting("base_url")
         if base_url != "/" and path.startswith(base_url):
             path = "/" + path[len(base_url) :]
+            scope = dict(scope, route_path=path)
         request = Request(scope, receive)
         # Populate request_messages if ds_messages cookie is present
         try:
@@ -1144,9 +1196,8 @@ class DatasetteRouter:
             await asgi_send_redirect(send, path.decode("latin1"))
         else:
             # Is there a pages/* template matching this path?
-            template_path = (
-                os.path.join("pages", *request.scope["path"].split("/")) + ".html"
-            )
+            route_path = request.scope.get("route_path", request.scope["path"])
+            template_path = os.path.join("pages", *route_path.split("/")) + ".html"
             try:
                 template = self.ds.jinja_env.select_template([template_path])
             except TemplateNotFound:
@@ -1154,7 +1205,7 @@ class DatasetteRouter:
             if template is None:
                 # Try for a pages/blah/{name}.html template match
                 for regex, wildcard_template in self.page_routes:
-                    match = regex.match(request.scope["path"])
+                    match = regex.match(route_path)
                     if match is not None:
                         context.update(match.groupdict())
                         template = wildcard_template
@@ -1357,8 +1408,8 @@ class DatasetteClient:
         self.ds = ds
         self.app = ds.app()
 
-    def _fix(self, path):
-        if not isinstance(path, PrefixedUrlString):
+    def _fix(self, path, avoid_path_rewrites=False):
+        if not isinstance(path, PrefixedUrlString) and not avoid_path_rewrites:
             path = self.ds.urls.path(path)
         if path.startswith("/"):
             path = f"http://localhost{path}"
@@ -1393,5 +1444,8 @@ class DatasetteClient:
             return await client.delete(self._fix(path), **kwargs)
 
     async def request(self, method, path, **kwargs):
+        avoid_path_rewrites = kwargs.pop("avoid_path_rewrites", None)
         async with httpx.AsyncClient(app=self.app) as client:
-            return await client.request(method, self._fix(path), **kwargs)
+            return await client.request(
+                method, self._fix(path, avoid_path_rewrites), **kwargs
+            )
