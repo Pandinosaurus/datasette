@@ -56,7 +56,7 @@ Create a file at ``/etc/systemd/system/datasette.service`` with the following co
 
 Add a random value for the ``DATASETTE_SECRET`` - this will be used to sign Datasette cookies such as the CSRF token cookie. You can generate a suitable value like so::
 
-    $ python3 -c 'import secrets; print(secrets.token_hex(32))'
+    python3 -c 'import secrets; print(secrets.token_hex(32))'
 
 This configuration will run Datasette against all database files contained in the ``/home/ubuntu/datasette-root`` directory. If that directory contains a ``metadata.yml`` (or ``.json``) file or a ``templates/`` or ``plugins/`` sub-directory those will automatically be loaded by Datasette - see :ref:`config_dir` for details.
 
@@ -65,23 +65,39 @@ You can start the Datasette process running using the following::
     sudo systemctl daemon-reload
     sudo systemctl start datasette.service
 
-You can confirm that Datasette is running on port 8000 like so::
+You will need to restart the Datasette service after making changes to its ``metadata.json`` configuration or adding a new database file to that directory. You can do that using::
+
+    sudo systemctl restart datasette.service
+
+Once the service has started you can confirm that Datasette is running on port 8000 like so::
 
     curl 127.0.0.1:8000/-/versions.json
     # Should output JSON showing the installed version
 
-Datasette will not be accessible from outside the server because it is listening on ``127.0.0.1``. You can expose it by instead listening on ``0.0.0.0``, but a better way is to set up a proxy such as ``nginx``.
+Datasette will not be accessible from outside the server because it is listening on ``127.0.0.1``. You can expose it by instead listening on ``0.0.0.0``, but a better way is to set up a proxy such as ``nginx`` - see :ref:`deploying_proxy`.
 
-Ubuntu offer `a tutorial on installing nginx <https://ubuntu.com/tutorials/install-and-configure-nginx#1-overview>`__. Once it is installed you can add configuration to proxy traffic through to Datasette that looks like this::
+.. _deploying_openrc:
 
-    server {
-        server_name mysubdomain.myhost.net;
+Running Datasette using OpenRC
+==============================
+OpenRC is the service manager on non-systemd Linux distributions like `Alpine Linux <https://www.alpinelinux.org/>`__ and `Gentoo <https://www.gentoo.org/>`__.
 
-        location / {
-            proxy_pass http://127.0.0.1:8000/;
-            proxy_set_header Host $host;
-        }
-    }
+Create an init script at ``/etc/init.d/datasette`` with the following contents:
+
+.. code-block:: sh
+
+    #!/sbin/openrc-run
+
+    name="datasette"
+    command="datasette"
+    command_args="serve -h 0.0.0.0 /path/to/db.db"
+    command_background=true
+    pidfile="/run/${RC_SVCNAME}.pid"
+
+You then need to configure the service to run at boot and start it::
+
+    rc-update add datasette
+    rc-service datasette start
 
 .. _deploying_buildpacks:
 
@@ -140,18 +156,36 @@ Here is an example of an `nginx <https://nginx.org/>`__ configuration file that 
     events {
       worker_connections  1024;
     }
-
     http {
       server {
         listen 80;
-
         location /my-datasette {
-          proxy_pass              http://127.0.0.1:8009/my-datasette;
-          proxy_set_header        X-Real-IP $remote_addr;
-          proxy_set_header        X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_pass http://127.0.0.1:8009/my-datasette;
+          proxy_set_header Host $host;
         }
       }
     }
+
+You can also use the ``--uds`` option to Datasette to listen on a Unix domain socket instead of a port, configuring the nginx upstream proxy like this::
+
+    daemon off;
+    events {
+      worker_connections  1024;
+    }
+    http {
+      server {
+        listen 80;
+        location /my-datasette {
+          proxy_pass http://datasette/my-datasette;
+          proxy_set_header Host $host;
+        }
+      }
+      upstream datasette {
+        server unix:/tmp/datasette.sock;
+      }
+    }
+
+Then run Datasette with ``datasette --uds /tmp/datasette.sock path/to/database.db --setting base_url /my-datasette/``.
 
 Apache proxy configuration
 --------------------------
@@ -161,6 +195,15 @@ For `Apache <https://httpd.apache.org/>`__, you can use the ``ProxyPass`` direct
     LoadModule proxy_module lib/httpd/modules/mod_proxy.so
     LoadModule proxy_http_module lib/httpd/modules/mod_proxy_http.so
 
-Then add this directive to proxy traffic::
+Then add these directives to proxy traffic::
 
-    ProxyPass          /datasette-prefix/    http://127.0.0.1:8009/datasette-prefix/
+    ProxyPass /my-datasette/ http://127.0.0.1:8009/my-datasette/
+    ProxyPreserveHost On
+
+A live demo of Datasette running behind Apache using this proxy setup can be seen at `datasette-apache-proxy-demo.datasette.io/prefix/ <https://datasette-apache-proxy-demo.datasette.io/prefix/>`__. The code for that demo can be found in the `demos/apache-proxy <https://github.com/simonw/datasette/tree/main/demos/apache-proxy>`__ directory.
+
+Using ``--uds`` you can use Unix domain sockets similar to the nginx example::
+
+    ProxyPass /my-datasette/ unix:/tmp/datasette.sock|http://localhost/my-datasette/
+
+The `ProxyPreserveHost On <https://httpd.apache.org/docs/2.4/mod/mod_proxy.html#proxypreservehost>`__ directive ensures that the original ``Host:`` header from the incoming request is passed through to Datasette. Datasette needs this to correctly assemble links to other pages using the :ref:`datasette_absolute_url` method.

@@ -1,16 +1,26 @@
 """
 Tests for various datasette helper functions.
 """
-from datasette.app import Datasette
-from datasette import utils
-from datasette.utils.asgi import Request
-from datasette.utils.sqlite import sqlite3
+
+import hashlib
 import json
 import os
 import pathlib
-import pytest
 import tempfile
 from unittest.mock import patch
+
+import pytest
+
+from datasette import utils
+from datasette.app import Datasette
+from datasette.utils.asgi import Request
+from datasette.utils.sqlite import (
+    sqlite3,
+    sqlite_derived_table_dependencies,
+    sqlite_hidden_table_names,
+    sqlite_table_type,
+    supports_returning,
+)
 
 
 @pytest.mark.parametrize(
@@ -19,8 +29,8 @@ from unittest.mock import patch
         ("foo", ["foo"]),
         ("foo,bar", ["foo", "bar"]),
         ("123,433,112", ["123", "433", "112"]),
-        ("123%2C433,112", ["123,433", "112"]),
-        ("123%2F433%2F112", ["123/433/112"]),
+        ("123~2C433,112", ["123,433", "112"]),
+        ("123~2F433~2F112", ["123/433/112"]),
     ],
 )
 def test_urlsafe_components(path, expected):
@@ -93,7 +103,7 @@ def test_path_with_replaced_args(path, args, expected):
     "row,pks,expected_path",
     [
         ({"A": "foo", "B": "bar"}, ["A", "B"], "foo,bar"),
-        ({"A": "f,o", "B": "bar"}, ["A", "B"], "f%2Co,bar"),
+        ({"A": "f,o", "B": "bar"}, ["A", "B"], "f~2Co,bar"),
         ({"A": 123}, ["A"], "123"),
         (
             utils.CustomRow(
@@ -125,7 +135,11 @@ def test_path_from_row_pks(row, pks, expected_path):
             """
         {"CategoryID": 1, "Description": "Soft drinks", "Picture": {"$base64": true, "encoded": "FRwCx60F/g=="}}
     """.strip(),
-        )
+        ),
+        (
+            {"message": b"hello"},
+            '{"message": {"$base64": true, "encoded": "aGVsbG8="}}',
+        ),
     ],
 )
 def test_custom_json_encoder(obj, expected):
@@ -141,6 +155,8 @@ def test_custom_json_encoder(obj, expected):
         "update blah set some_column='# Hello there\n\n* This is a list\n* of items\n--\n[And a link](https://github.com/simonw/datasette-render-markdown).'\nas demo_markdown",
         "PRAGMA case_sensitive_like = true",
         "SELECT * FROM pragma_not_on_allow_list('idx52')",
+        "/* This comment is not valid. select 1",
+        "/**/\nupdate foo set bar = 1\n/* test */ select 1",
     ],
 )
 def test_validate_sql_select_bad(bad_sql):
@@ -157,13 +173,22 @@ def test_validate_sql_select_bad(bad_sql):
         "select '# Hello there\n\n* This is a list\n* of items\n--\n[And a link](https://github.com/simonw/datasette-render-markdown).'\nas demo_markdown",
         "select 1 + 1",
         "explain select 1 + 1",
+        "explain\nselect 1 + 1",
         "explain query plan select 1 + 1",
+        "explain  query  plan\nselect 1 + 1",
         "SELECT\nblah FROM foo",
         "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 10) SELECT x FROM cnt;",
         "explain WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 10) SELECT x FROM cnt;",
         "explain query plan WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 10) SELECT x FROM cnt;",
         "SELECT * FROM pragma_index_info('idx52')",
         "select * from pragma_table_xinfo('table')",
+        # Various types of comment
+        "-- comment\nselect 1",
+        "-- one line\n  -- two line\nselect 1",
+        "  /* comment */\nselect 1",
+        "  /* comment */select 1",
+        "/* comment */\n -- another\n /* one more */ select 1",
+        "/* This comment \n has multiple lines */\nselect 1",
     ],
 )
 def test_validate_sql_select_good(good_sql):
@@ -172,7 +197,7 @@ def test_validate_sql_select_good(good_sql):
 
 @pytest.mark.parametrize("open_quote,close_quote", [('"', '"'), ("[", "]")])
 def test_detect_fts(open_quote, close_quote):
-    sql = """
+    sql = f"""
     CREATE TABLE "Dumb_Table" (
       "TreeID" INTEGER,
       "qSpecies" TEXT
@@ -187,17 +212,204 @@ def test_detect_fts(open_quote, close_quote):
       "qCaretaker" TEXT
     );
     CREATE VIEW Test_View AS SELECT * FROM Dumb_Table;
-    CREATE VIRTUAL TABLE {open}Street_Tree_List_fts{close} USING FTS4 ("qAddress", "qCaretaker", "qSpecies", content={open}Street_Tree_List{close});
+    CREATE VIRTUAL TABLE {open_quote}Street_Tree_List_fts{close_quote} USING FTS4 ("qAddress", "qCaretaker", "qSpecies", content={open_quote}Street_Tree_List{close_quote});
     CREATE VIRTUAL TABLE r USING rtree(a, b, c);
-    """.format(
-        open=open_quote, close=close_quote
-    )
+    """
     conn = utils.sqlite3.connect(":memory:")
     conn.executescript(sql)
     assert None is utils.detect_fts(conn, "Dumb_Table")
     assert None is utils.detect_fts(conn, "Test_View")
     assert None is utils.detect_fts(conn, "r")
     assert "Street_Tree_List_fts" == utils.detect_fts(conn, "Street_Tree_List")
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "identifier,expected",
+    (
+        ("plain", "plain"),
+        ("plain\n", '"plain\n"'),
+        ("select\n", '"select\n"'),
+        ("select", '"select"'),
+        ("has space", '"has space"'),
+        ("has'quote", '"has\'quote"'),
+        ('has"dquote', '"has""dquote"'),
+        ("has]bracket", '"has]bracket"'),
+        ('has"dquote]', '"has""dquote]"'),
+    ),
+)
+def test_escape_sqlite(identifier, expected):
+    assert utils.escape_sqlite(identifier) == expected
+
+
+def test_escape_sqlite_double_quotes_work_in_query():
+    conn = utils.sqlite3.connect(":memory:")
+    table = 'table with "double quotes"'
+    column = "select"
+    escaped_table = utils.escape_sqlite(table)
+    escaped_column = utils.escape_sqlite(column)
+    conn.execute(f"CREATE TABLE {escaped_table} ({escaped_column} TEXT)")
+    create_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()[0]
+    assert create_sql == 'CREATE TABLE "table with ""double quotes""" ("select" TEXT)'
+    conn.execute(
+        f"INSERT INTO {escaped_table} ({escaped_column}) VALUES (?)", ("hello",)
+    )
+    results = conn.execute(f"SELECT {escaped_column} FROM {escaped_table}").fetchall()
+    conn.close()
+    assert results == [("hello",)]
+
+
+def test_escape_sqlite_prevents_injection():
+    # https://github.com/simonw/datasette/issues/2677
+    conn = utils.sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE users (id INTEGER, password TEXT)")
+    conn.execute("INSERT INTO users VALUES (1, 'super_secret_password')")
+    malicious = "users] UNION SELECT password FROM users--"
+    conn.execute(f'CREATE TABLE "{malicious}" (id INTEGER)')
+    sql = f"select count(*) from {utils.escape_sqlite(malicious)}"
+    results = conn.execute(sql).fetchall()
+    conn.close()
+    # The injected UNION must not execute - only the empty malicious table
+    # is queried, so we get a single count row and no leaked password
+    assert results == [(0,)]
+
+
+@pytest.mark.parametrize("table", ("regular", "has'single quote"))
+def test_detect_fts_different_table_names(table):
+    sql = f"""
+    CREATE TABLE [{table}] (
+      "TreeID" INTEGER,
+      "qSpecies" TEXT
+    );
+    CREATE VIRTUAL TABLE [{table}_fts] USING FTS4 ("qSpecies", content="{table}");
+    """
+    conn = utils.sqlite3.connect(":memory:")
+    conn.executescript(sql)
+    assert f"{table}_fts" == utils.detect_fts(conn, table)
+    conn.close()
+
+
+def test_supports_returning():
+    conn = utils.sqlite3.connect(":memory:")
+    try:
+        conn.execute("create table t (id integer primary key)")
+        conn.execute("insert into t default values returning id").fetchone()
+        expected = True
+    except sqlite3.DatabaseError:
+        expected = False
+    finally:
+        conn.close()
+
+    assert supports_returning() is expected
+
+
+@pytest.mark.parametrize("use_fallback", (False, True))
+def test_sqlite_table_type_detects_virtual_and_shadow_tables(monkeypatch, use_fallback):
+    if use_fallback:
+        monkeypatch.setattr("datasette.utils.sqlite.sqlite_version", lambda: (3, 25, 0))
+    conn = utils.sqlite3.connect(":memory:")
+    try:
+        conn.executescript("""
+            create table dogs(id integer primary key, name text);
+            create view dog_names as select name from dogs;
+            create virtual table search_index using fts5(title, body);
+            create virtual table boxes using rtree(id, minx, maxx, miny, maxy);
+        """)
+
+        assert sqlite_table_type(conn, "dogs") == "table"
+        assert sqlite_table_type(conn, "dog_names") == "view"
+        assert sqlite_table_type(conn, "search_index") == "virtual"
+        assert sqlite_table_type(conn, "search_index_config") == "shadow"
+        assert sqlite_table_type(conn, "boxes") == "virtual"
+        assert sqlite_table_type(conn, "boxes_node") == "shadow"
+        assert sqlite_table_type(conn, "missing") is None
+        assert sqlite_hidden_table_names(conn) == [
+            "boxes_node",
+            "boxes_parent",
+            "boxes_rowid",
+            "search_index_config",
+            "search_index_content",
+            "search_index_data",
+            "search_index_docsize",
+            "search_index_idx",
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("use_fallback", (False, True))
+def test_sqlite_table_type_detects_attached_database_tables(monkeypatch, use_fallback):
+    if use_fallback:
+        monkeypatch.setattr("datasette.utils.sqlite.sqlite_version", lambda: (3, 25, 0))
+    conn = utils.sqlite3.connect(":memory:")
+    try:
+        conn.executescript("""
+            attach database ':memory:' as extra;
+            create table extra.cats(id integer primary key, name text);
+            create virtual table extra.cat_search using fts5(name);
+        """)
+
+        assert sqlite_table_type(conn, "cats", schema="extra") == "table"
+        assert sqlite_table_type(conn, "cat_search", schema="extra") == "virtual"
+        assert sqlite_table_type(conn, "cat_search_data", schema="extra") == "shadow"
+    finally:
+        conn.close()
+
+
+def test_sqlite_hidden_table_names_hides_multiline_content_fts_table():
+    conn = utils.sqlite3.connect(":memory:")
+    try:
+        conn.executescript("""
+            create table searchable(id integer primary key, body text);
+            create virtual table searchable_fts
+                using fts5(body, content='searchable', content_rowid='id');
+        """)
+
+        assert "searchable_fts" in sqlite_hidden_table_names(conn)
+    finally:
+        conn.close()
+
+
+def test_sqlite_derived_table_dependencies():
+    conn = utils.sqlite3.connect(":memory:")
+    try:
+        conn.executescript("""
+            create table docs(id integer primary key, body text);
+            create virtual table external_fts5 using fts5(
+                body, content='docs', content_rowid='id'
+            );
+            create virtual table internal_fts5 using fts5(body);
+            create virtual table contentless_fts5 using fts5(body, content='');
+            create virtual table external_fts4 using fts4(body, content="docs");
+            create virtual table internal_fts4 using fts4(body);
+            create virtual table contentless_fts4 using fts4(body, content="");
+            create table [docs, archive](body text);
+            create virtual table commented_fts5 using fts5(
+                body, tokenize='porter unicode61',
+                /* Comments and commas in quoted values must not confuse parsing. */
+                content='docs, archive'
+            );
+            create virtual table boxes using rtree(id, minx, maxx, miny, maxy);
+        """)
+
+        dependencies = sqlite_derived_table_dependencies(conn)
+
+        assert dependencies["external_fts5"] == "docs"
+        assert dependencies["external_fts4"] == "docs"
+        assert dependencies["commented_fts5"] == "docs, archive"
+        assert "contentless_fts5" not in dependencies
+        assert "contentless_fts4" not in dependencies
+        assert dependencies["internal_fts5_content"] == "internal_fts5"
+        assert dependencies["internal_fts4_content"] == "internal_fts4"
+        assert dependencies["external_fts5_data"] == "external_fts5"
+        assert dependencies["external_fts4_segments"] == "external_fts4"
+        assert dependencies["boxes_node"] == "boxes"
+        assert dependencies["boxes_parent"] == "boxes"
+        assert dependencies["boxes_rowid"] == "boxes"
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(
@@ -319,53 +531,23 @@ def test_compound_keys_after_sql():
 ((a > :p0)
   or
 (a = :p0 and b > :p1))
-    """.strip() == utils.compound_keys_after_sql(
-        ["a", "b"]
-    )
+    """.strip() == utils.compound_keys_after_sql(["a", "b"])
     assert """
 ((a > :p0)
   or
 (a = :p0 and b > :p1)
   or
 (a = :p0 and b = :p1 and c > :p2))
-    """.strip() == utils.compound_keys_after_sql(
-        ["a", "b", "c"]
-    )
-
-
-async def table_exists(table):
-    return table == "exists.csv"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "table_and_format,expected_table,expected_format",
-    [
-        ("blah", "blah", None),
-        ("blah.csv", "blah", "csv"),
-        ("blah.json", "blah", "json"),
-        ("blah.baz", "blah.baz", None),
-        ("exists.csv", "exists.csv", None),
-    ],
-)
-async def test_resolve_table_and_format(
-    table_and_format, expected_table, expected_format
-):
-    actual_table, actual_format = await utils.resolve_table_and_format(
-        table_and_format, table_exists, ["json"]
-    )
-    assert expected_table == actual_table
-    assert expected_format == actual_format
+    """.strip() == utils.compound_keys_after_sql(["a", "b", "c"])
 
 
 def test_table_columns():
     conn = sqlite3.connect(":memory:")
-    conn.executescript(
-        """
+    conn.executescript("""
     create table places (id integer primary key, name text, bob integer)
-    """
-    )
+    """)
     assert ["id", "name", "bob"] == utils.table_columns(conn, "places")
+    conn.close()
 
 
 @pytest.mark.parametrize(
@@ -375,9 +557,7 @@ def test_table_columns():
         ("/foo?sql=select+1", "json", {}, "/foo.json?sql=select+1"),
         ("/foo/bar", "json", {}, "/foo/bar.json"),
         ("/foo/bar", "csv", {}, "/foo/bar.csv"),
-        ("/foo/bar.csv", "json", {}, "/foo/bar.csv?_format=json"),
         ("/foo/bar", "csv", {"_dl": 1}, "/foo/bar.csv?_dl=1"),
-        ("/foo/b.csv", "json", {"_dl": 1}, "/foo/b.csv?_dl=1&_format=json"),
         (
             "/sf-trees/Street_Tree_List?_search=cherry&_size=1000",
             "csv",
@@ -392,16 +572,10 @@ def test_path_with_format(path, format, extra_qs, expected):
     assert expected == actual
 
 
-def test_path_with_format_replace_format():
-    request = Request.fake("/foo/bar.csv")
-    assert (
-        utils.path_with_format(request=request, format="blob")
-        == "/foo/bar.csv?_format=blob"
-    )
-    assert (
-        utils.path_with_format(request=request, format="blob", replace_format="csv")
-        == "/foo/bar.blob"
-    )
+def test_path_with_format_can_override_request_path():
+    request = Request.fake("/prefix/foo?x=1")
+    actual = utils.path_with_format(request=request, path="/foo", format="json")
+    assert "/foo.json?x=1" == actual
 
 
 @pytest.mark.parametrize(
@@ -454,11 +628,13 @@ def test_check_connection_spatialite_raises():
     conn = sqlite3.connect(path)
     with pytest.raises(utils.SpatialiteConnectionProblem):
         utils.check_connection(conn)
+    conn.close()
 
 
 def test_check_connection_passes():
     conn = sqlite3.connect(":memory:")
     utils.check_connection(conn)
+    conn.close()
 
 
 def test_call_with_supported_arguments():
@@ -559,7 +735,6 @@ def test_resolve_env_secrets(config, expected):
     [
         ({"id": "blah"}, "blah"),
         ({"id": "blah", "login": "l"}, "l"),
-        ({"id": "blah", "login": "l"}, "l"),
         ({"id": "blah", "login": "l", "username": "u"}, "u"),
         ({"login": "l", "name": "n"}, "n"),
         (
@@ -585,12 +760,208 @@ def test_display_actor(actor, expected):
 async def test_initial_path_for_datasette(tmp_path_factory, dbs, expected_path):
     db_dir = tmp_path_factory.mktemp("dbs")
     one_table = str(db_dir / "one.db")
-    sqlite3.connect(one_table).execute("create table one (id integer primary key)")
+    conn1 = sqlite3.connect(one_table)
+    conn1.execute("create table one (id integer primary key)")
+    conn1.close()
     two_tables = str(db_dir / "two.db")
-    sqlite3.connect(two_tables).execute("create table two (id integer primary key)")
-    sqlite3.connect(two_tables).execute("create table three (id integer primary key)")
+    conn2 = sqlite3.connect(two_tables)
+    conn2.execute("create table two (id integer primary key)")
+    conn2.execute("create table three (id integer primary key)")
+    conn2.close()
     datasette = Datasette(
         [{"one_table": one_table, "two_tables": two_tables}[db] for db in dbs]
     )
     path = await utils.initial_path_for_datasette(datasette)
     assert path == expected_path
+
+
+@pytest.mark.parametrize(
+    "content,expected",
+    (
+        ("title: Hello", {"title": "Hello"}),
+        ('{"title": "Hello"}', {"title": "Hello"}),
+        ("{{ this }} is {{ bad }}", None),
+    ),
+)
+def test_parse_metadata(content, expected):
+    if expected is None:
+        with pytest.raises(utils.BadMetadataError):
+            utils.parse_metadata(content)
+    else:
+        assert utils.parse_metadata(content) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sql,expected",
+    (
+        ("select 1", []),
+        ("select 1 + :one", ["one"]),
+        ("select 1 + :one + :two", ["one", "two"]),
+        ("select 'bob' || '0:00' || :cat", ["cat"]),
+        ("select this is invalid :one, :two, :three", ["one", "two", "three"]),
+        # A string literal containing a comment marker should not hide
+        # parameters that come after it
+        ("select * from t where note = '-- TODO' and id = :id", ["id"]),
+        ("select '--' || :y", ["y"]),
+        ("select * from t where note = '/* x */' and id = :id", ["id"]),
+        # Parameters that live inside a comment should be ignored
+        ("select :x -- and :ignored", ["x"]),
+        ("select :x /* and :ignored */ from t", ["x"]),
+        ("select :x /* and :ignored", ["x"]),
+        # Parameters inside quoted identifiers should be ignored
+        ("select [a:b] from t where id = :id", ["id"]),
+        ("select `a:b` from t where id = :id", ["id"]),
+        ("select `a``:b` from t where id = :id", ["id"]),
+        # Parameters inside a string literal should be ignored
+        ("select ':ignored' || :real", ["real"]),
+    ),
+)
+@pytest.mark.parametrize("use_async_version", (False, True))
+async def test_named_parameters(sql, expected, use_async_version):
+    ds = Datasette([], memory=True)
+    db = ds.get_database("_memory")
+    if use_async_version:
+        params = await utils.derive_named_parameters(db, sql)
+    else:
+        params = utils.named_parameters(sql)
+    assert params == expected
+
+
+@pytest.mark.parametrize(
+    "original,expected",
+    (
+        ("abc", "abc"),
+        ("/foo/bar", "~2Ffoo~2Fbar"),
+        ("/-/bar", "~2F-~2Fbar"),
+        ("-/db-/table.csv", "-~2Fdb-~2Ftable~2Ecsv"),
+        (r"%~-/", "~25~7E-~2F"),
+        ("~25~7E~2D~2F", "~7E25~7E7E~7E2D~7E2F"),
+        ("with space", "with+space"),
+    ),
+)
+def test_tilde_encoding(original, expected):
+    actual = utils.tilde_encode(original)
+    assert actual == expected
+    # And test round-trip
+    assert original == utils.tilde_decode(actual)
+
+
+@pytest.mark.parametrize(
+    "url,length,expected",
+    (
+        ("https://example.com/", 5, "http…"),
+        ("https://example.com/foo/bar", 15, "https://exampl…"),
+        ("https://example.com/foo/bar/baz.jpg", 30, "https://example.com/foo/ba….jpg"),
+        # Extensions longer than 4 characters are not treated specially:
+        ("https://example.com/foo/bar/baz.jpeg2", 30, "https://example.com/foo/bar/b…"),
+        (
+            "https://example.com/foo/bar/baz.jpeg2",
+            None,
+            "https://example.com/foo/bar/baz.jpeg2",
+        ),
+    ),
+)
+def test_truncate_url(url, length, expected):
+    actual = utils.truncate_url(url, length)
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "pairs,expected",
+    (
+        # Simple nested objects
+        ([("a", "b")], {"a": "b"}),
+        ([("a.b", "c")], {"a": {"b": "c"}}),
+        # JSON literals
+        ([("a.b", "true")], {"a": {"b": True}}),
+        ([("a.b", "false")], {"a": {"b": False}}),
+        ([("a.b", "null")], {"a": {"b": None}}),
+        ([("a.b", "1")], {"a": {"b": 1}}),
+        ([("a.b", "1.1")], {"a": {"b": 1.1}}),
+        # Nested JSON literals
+        ([("a.b", '{"foo": "bar"}')], {"a": {"b": {"foo": "bar"}}}),
+        ([("a.b", "[1, 2, 3]")], {"a": {"b": [1, 2, 3]}}),
+        # JSON strings are preserved
+        ([("a.b", '"true"')], {"a": {"b": "true"}}),
+        ([("a.b", '"[1, 2, 3]"')], {"a": {"b": "[1, 2, 3]"}}),
+        # Later keys over-ride the previous
+        (
+            [
+                ("a", "b"),
+                ("a.b", "c"),
+            ],
+            {"a": {"b": "c"}},
+        ),
+        (
+            [
+                ("settings.trace_debug", "true"),
+                ("plugins.datasette-ripgrep.path", "/etc"),
+                ("settings.trace_debug", "false"),
+            ],
+            {
+                "settings": {
+                    "trace_debug": False,
+                },
+                "plugins": {
+                    "datasette-ripgrep": {
+                        "path": "/etc",
+                    }
+                },
+            },
+        ),
+    ),
+)
+def test_pairs_to_nested_config(pairs, expected):
+    actual = utils.pairs_to_nested_config(pairs)
+    assert actual == expected
+
+
+def test_sha256_file(tmp_path):
+    path = tmp_path / "test.txt"
+    path.write_text("hello")
+    assert utils.sha256_file(path, chunk_size=2) == hashlib.sha256(b"hello").hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_calculate_etag(tmp_path):
+    path = tmp_path / "test.txt"
+    path.write_text("hello")
+    etag = '"5d41402abc4b2a76b9719d911017c592"'
+    assert etag == await utils.calculate_etag(path)
+    assert utils._etag_cache[path] == etag
+    utils._etag_cache[path] = "hash"
+    assert "hash" == await utils.calculate_etag(path)
+    utils._etag_cache.clear()
+
+
+@pytest.mark.parametrize(
+    "dict1,dict2,expected",
+    [
+        # Basic update
+        ({"a": 1, "b": 2}, {"b": 3, "c": 4}, {"a": 1, "b": 3, "c": 4}),
+        # Nested dictionary update
+        (
+            {"a": 1, "b": {"x": 10, "y": 20}},
+            {"b": {"y": 30, "z": 40}},
+            {"a": 1, "b": {"x": 10, "y": 30, "z": 40}},
+        ),
+        # Deep nested update
+        (
+            {"a": {"b": {"c": 1}}},
+            {"a": {"b": {"d": 2}}},
+            {"a": {"b": {"c": 1, "d": 2}}},
+        ),
+        # Update with mixed types
+        (
+            {"a": 1, "b": {"x": 10}},
+            {"b": {"y": 20}, "c": [1, 2, 3]},
+            {"a": 1, "b": {"x": 10, "y": 20}, "c": [1, 2, 3]},
+        ),
+    ],
+)
+def test_deep_dict_update(dict1, dict2, expected):
+    result = utils.deep_dict_update(dict1, dict2)
+    assert result == expected
+    # Check that the original dict1 was modified
+    assert dict1 == expected

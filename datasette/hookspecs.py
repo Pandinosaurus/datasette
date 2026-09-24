@@ -1,5 +1,4 @@
-from pluggy import HookimplMarker
-from pluggy import HookspecMarker
+from pluggy import HookimplMarker, HookspecMarker
 
 hookspec = HookspecMarker("datasette")
 hookimpl = HookimplMarker("datasette")
@@ -8,6 +7,11 @@ hookimpl = HookimplMarker("datasette")
 @hookspec
 def startup(datasette):
     """Fires directly after Datasette first starts running"""
+
+
+@hookspec
+def shutdown(datasette):
+    """Called once when the Datasette server is shutting down"""
 
 
 @hookspec
@@ -21,7 +25,7 @@ def prepare_connection(conn, database, datasette):
 
 
 @hookspec
-def prepare_jinja2_environment(env):
+def prepare_jinja2_environment(env, datasette):
     """Modify Jinja2 template environment e.g. register custom template tags"""
 
 
@@ -46,7 +50,7 @@ def extra_body_script(
 def extra_template_vars(
     template, database, table, columns, view_name, request, datasette
 ):
-    """Extra template variables to be made available to the template - can return dict or callable or awaitable"""
+    """Extra template variables to be made available to the template - can return dict, None, callable or awaitable"""
 
 
 @hookspec
@@ -54,8 +58,18 @@ def publish_subcommand(publish):
     """Subcommands for 'datasette publish'"""
 
 
-@hookspec(firstresult=True)
-def render_cell(value, column, table, database, datasette):
+@hookspec
+def render_cell(
+    row,
+    value,
+    column,
+    table,
+    pks,
+    database,
+    datasette,
+    request,
+    column_type,
+):
     """Customize rendering of HTML table cell values"""
 
 
@@ -70,8 +84,23 @@ def register_facet_classes():
 
 
 @hookspec
-def register_routes():
+def register_actions(datasette):
+    """Register actions: returns a list of datasette.permission.Action objects"""
+
+
+@hookspec
+def register_column_types(datasette):
+    """Return a list of ColumnType subclasses"""
+
+
+@hookspec
+def register_routes(datasette):
     """Register URL routes: return a list of (regex, view_function) pairs"""
+
+
+@hookspec
+def register_commands(cli):
+    """Register additional CLI commands, e.g. 'datasette mycommand ...'"""
 
 
 @hookspec
@@ -79,14 +108,37 @@ def actor_from_request(datasette, request):
     """Return an actor dictionary based on the incoming request"""
 
 
-@hookspec
-def permission_allowed(datasette, actor, action, resource):
-    """Check if actor is allowed to perfom this action - return True, False or None"""
+@hookspec(firstresult=True)
+def actors_from_ids(datasette, actor_ids):
+    """Returns a dictionary mapping those IDs to actor dictionaries"""
 
 
 @hookspec
-def canned_queries(datasette, database, actor):
-    """Return a dictonary of canned query definitions or an awaitable function that returns them"""
+def jinja2_environment_from_request(datasette, request, env):
+    """Return a Jinja2 environment based on the incoming request"""
+
+
+@hookspec
+def filters_from_request(request, database, table, datasette):
+    """
+    Return datasette.filters.FilterArguments(
+        where_clauses=[str, str, str],
+        params={},
+        human_descriptions=[str, str, str],
+        extra_context={}
+    ) based on the request"""
+
+
+@hookspec
+def permission_resources_sql(datasette, actor, action):
+    """Return SQL query fragments for permission checks on resources.
+
+    Returns None, a PermissionSQL object, or a list of PermissionSQL objects.
+    Each PermissionSQL contains SQL that should return rows with columns:
+    parent (str|None), child (str|None), allow (int), reason (str).
+
+    Used to efficiently check permissions across multiple resources at once.
+    """
 
 
 @hookspec
@@ -100,15 +152,118 @@ def forbidden(datasette, request, message):
 
 
 @hookspec
-def menu_links(datasette, actor):
+def menu_links(datasette, actor, request):
     """Links for the navigation menu"""
 
 
 @hookspec
-def table_actions(datasette, actor, database, table):
-    """Links for the table actions menu"""
+def jump_items_sql(datasette, actor, request):
+    """SQL fragments for extra items in the jump menu"""
 
 
 @hookspec
-def database_actions(datasette, actor, database):
-    """Links for the database actions menu"""
+def row_actions(datasette, actor, request, database, table, row):
+    """Items for the row actions menu"""
+
+
+@hookspec
+def table_actions(datasette, actor, database, table, request):
+    """Items for the table actions menu"""
+
+
+@hookspec
+def view_actions(datasette, actor, database, view, request):
+    """Items for the view actions menu"""
+
+
+@hookspec
+def query_actions(datasette, actor, database, query_name, request, sql, params):
+    """Items for the query and stored query actions menu"""
+
+
+@hookspec
+def database_actions(datasette, actor, database, request):
+    """Items for the database actions menu"""
+
+
+@hookspec
+def homepage_actions(datasette, actor, request):
+    """Items for the homepage actions menu"""
+
+
+@hookspec
+def handle_exception(datasette, request, exception):
+    """Handle an uncaught exception. Can return a Response or None."""
+
+
+@hookspec
+def track_event(datasette, event):
+    """Respond to an event tracked by Datasette"""
+
+
+@hookspec
+def register_events(datasette):
+    """Return a list of Event subclasses to use with track_event()"""
+
+
+@hookspec
+def top_homepage(datasette, request):
+    """HTML to include at the top of the homepage"""
+
+
+@hookspec
+def top_database(datasette, request, database):
+    """HTML to include at the top of the database page"""
+
+
+@hookspec
+def top_table(datasette, request, database, table):
+    """HTML to include at the top of the table page"""
+
+
+@hookspec
+def top_row(datasette, request, database, table, row):
+    """HTML to include at the top of the row page"""
+
+
+@hookspec
+def top_query(datasette, request, database, sql):
+    """HTML to include at the top of the query results page"""
+
+
+@hookspec
+def top_stored_query(datasette, request, database, query_name):
+    """HTML to include at the top of the stored query page"""
+
+
+@hookspec
+def register_token_handler(datasette):
+    """Return a TokenHandler instance for token creation and verification"""
+
+
+@hookspec
+def write_wrapper(datasette, database, request, transaction):
+    """Called when a write function is about to execute.
+
+    Return a generator function that accepts a ``conn`` argument and
+    optionally a ``track_event`` argument.  The generator should
+    ``yield`` exactly once: code before the ``yield`` runs before
+    the write, code after the ``yield`` runs after the write
+    completes. The result of the write is sent back through the
+    ``yield``, so you can capture it with ``result = yield``.
+
+    If your generator accepts ``track_event``, you can call
+    ``track_event(event)`` to queue an event that will be dispatched
+    via ``datasette.track_event()`` after the write commits
+    successfully.  Events are discarded if the write raises an
+    exception.
+
+    If the write raises an exception, it is thrown into the generator
+    so you can handle it with a try/except around the ``yield``.
+
+    ``request`` may be ``None`` for writes not originating from an
+    HTTP request.  ``transaction`` is ``True`` if the write will
+    be wrapped in a transaction.
+
+    Return ``None`` to skip wrapping.
+    """

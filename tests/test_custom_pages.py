@@ -1,67 +1,83 @@
 import pathlib
+
 import pytest
+
 from .fixtures import make_app_client
+
+TEST_TEMPLATE_DIRS = str(pathlib.Path(__file__).parent / "test_templates")
 
 
 @pytest.fixture(scope="session")
 def custom_pages_client():
+    with make_app_client(template_dir=TEST_TEMPLATE_DIRS) as client:
+        yield client
+
+
+@pytest.fixture(scope="session")
+def custom_pages_client_with_base_url():
     with make_app_client(
-        template_dir=str(pathlib.Path(__file__).parent / "test_templates")
+        template_dir=TEST_TEMPLATE_DIRS, settings={"base_url": "/prefix/"}
     ) as client:
         yield client
 
 
 def test_custom_pages_view_name(custom_pages_client):
     response = custom_pages_client.get("/about")
-    assert 200 == response.status
-    assert "ABOUT! view_name:page" == response.text
+    assert response.status == 200
+    assert response.text == "ABOUT! view_name:page"
 
 
 def test_request_is_available(custom_pages_client):
     response = custom_pages_client.get("/request")
-    assert 200 == response.status
-    assert "path:/request" == response.text
+    assert response.status == 200
+    assert response.text == "path:/request"
+
+
+def test_custom_pages_with_base_url(custom_pages_client_with_base_url):
+    response = custom_pages_client_with_base_url.get("/prefix/request")
+    assert response.status == 200
+    assert response.text == "path:/prefix/request"
 
 
 def test_custom_pages_nested(custom_pages_client):
     response = custom_pages_client.get("/nested/nest")
-    assert 200 == response.status
-    assert "Nest!" == response.text
+    assert response.status == 200
+    assert response.text == "Nest!"
     response = custom_pages_client.get("/nested/nest2")
-    assert 404 == response.status
+    assert response.status == 404
 
 
 def test_custom_status(custom_pages_client):
     response = custom_pages_client.get("/202")
-    assert 202 == response.status
-    assert "202!" == response.text
+    assert response.status == 202
+    assert response.text == "202!"
 
 
 def test_custom_headers(custom_pages_client):
     response = custom_pages_client.get("/headers")
-    assert 200 == response.status
-    assert "foo" == response.headers["x-this-is-foo"]
-    assert "bar" == response.headers["x-this-is-bar"]
-    assert "FOOBAR" == response.text
+    assert response.status == 200
+    assert response.headers["x-this-is-foo"] == "foo"
+    assert response.headers["x-this-is-bar"] == "bar"
+    assert response.text == "FOOBAR"
 
 
 def test_custom_content_type(custom_pages_client):
     response = custom_pages_client.get("/atom")
-    assert 200 == response.status
+    assert response.status == 200
     assert response.headers["content-type"] == "application/xml"
-    assert "<?xml ...>" == response.text
+    assert response.text == "<?xml ...>"
 
 
 def test_redirect(custom_pages_client):
-    response = custom_pages_client.get("/redirect", allow_redirects=False)
-    assert 302 == response.status
-    assert "/example" == response.headers["Location"]
+    response = custom_pages_client.get("/redirect")
+    assert response.status == 302
+    assert response.headers["Location"] == "/example"
 
 
 def test_redirect2(custom_pages_client):
-    response = custom_pages_client.get("/redirect2", allow_redirects=False)
-    assert 301 == response.status
-    assert "/example" == response.headers["Location"]
+    response = custom_pages_client.get("/redirect2")
+    assert response.status == 301
+    assert response.headers["Location"] == "/example"
 
 
 @pytest.mark.parametrize(
@@ -83,3 +99,31 @@ def test_custom_route_pattern_404(custom_pages_client):
     assert response.status == 404
     assert "<h1>Error 404</h1>" in response.text
     assert ">Oh no</" in response.text
+
+
+def test_custom_route_pattern_with_slash_slash_302(custom_pages_client):
+    # https://github.com/simonw/datasette/issues/2429
+    response = custom_pages_client.get("//example.com/")
+    assert response.status == 302
+    assert response.headers["location"] == "/example.com"
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/\\example.com/",
+        "/\\\\example.com/",
+        "/\\/example.com/",
+    ),
+)
+def test_redirect_does_not_allow_backslash_open_redirect(custom_pages_client, path):
+    # https://github.com/simonw/datasette/issues/2680
+    # Browsers normalise backslashes to forward slashes, so a Location of
+    # /\example.com would be treated as the protocol-relative //example.com
+    response = custom_pages_client.get(path)
+    assert response.status == 302
+    location = response.headers["location"]
+    assert location == "/example.com"
+    # Must not start with anything a browser reads as protocol-relative
+    assert not location.startswith("//")
+    assert not location.startswith("/\\")

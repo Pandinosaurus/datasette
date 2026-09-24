@@ -1,29 +1,30 @@
-# Datasette
+<img src="https://datasette.io/static/datasette-logo.svg" alt="Datasette">
 
 [![PyPI](https://img.shields.io/pypi/v/datasette.svg)](https://pypi.org/project/datasette/)
-[![Changelog](https://img.shields.io/github/v/release/simonw/datasette?label=changelog)](https://docs.datasette.io/en/stable/changelog.html)
+[![Changelog](https://img.shields.io/github/v/release/simonw/datasette?label=changelog)](https://docs.datasette.io/en/latest/changelog.html)
 [![Python 3.x](https://img.shields.io/pypi/pyversions/datasette.svg?logo=python&logoColor=white)](https://pypi.org/project/datasette/)
 [![Tests](https://github.com/simonw/datasette/workflows/Test/badge.svg)](https://github.com/simonw/datasette/actions?query=workflow%3ATest)
 [![Documentation Status](https://readthedocs.org/projects/datasette/badge/?version=latest)](https://docs.datasette.io/en/latest/?badge=latest)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/simonw/datasette/blob/main/LICENSE)
 [![docker: datasette](https://img.shields.io/badge/docker-datasette-blue)](https://hub.docker.com/r/datasetteproject/datasette)
+[![discord](https://img.shields.io/discord/823971286308356157?label=discord)](https://datasette.io/discord)
 
 *An open source multi-tool for exploring and publishing data*
 
 Datasette is a tool for exploring and publishing data. It helps people take data of any shape or size and publish that as an interactive, explorable website and accompanying API.
 
-Datasette is aimed at data journalists, museum curators, archivists, local governments and anyone else who has data that they wish to share with the world.
+Datasette is aimed at data journalists, museum curators, archivists, local governments, scientists, researchers and anyone else who has data that they wish to share with the world.
 
-[Explore a demo](https://global-power-plants.datasettes.com/global-power-plants/global-power-plants), watch [a video about the project](https://simonwillison.net/2021/Feb/7/video/) or try it out by [uploading and publishing your own CSV data](https://simonwillison.net/2019/Apr/23/datasette-glitch/).
+[Explore a demo](https://datasette.io/global-power-plants/global-power-plants), watch [a video about the project](https://simonwillison.net/2021/Feb/7/video/) or try it out [on GitHub Codespaces](https://github.com/datasette/datasette-studio).
 
 * [datasette.io](https://datasette.io/) is the official project website
 * Latest [Datasette News](https://datasette.io/news)
 * Comprehensive documentation: https://docs.datasette.io/
 * Examples: https://datasette.io/examples
-* Live demo of current main: https://latest.datasette.io/
-* Support questions, feedback? Join our [GitHub Discussions forum](https://github.com/simonw/datasette/discussions)
+* Live demo of current `main` branch: https://latest.datasette.io/
+* Questions, feedback or want to talk about the project? Join our [Discord](https://datasette.io/discord)
 
-Want to stay up-to-date with the project? Subscribe to the [Datasette Weekly newsletter](https://datasette.substack.com/) for tips, tricks and news on what's new in the Datasette ecosystem.
+Want to stay up-to-date with the project? Subscribe to the [Datasette newsletter](https://datasette.substack.com/) for tips, tricks and news on what's new in the Datasette ecosystem.
 
 ## Installation
 
@@ -35,7 +36,7 @@ You can also install it using `pip` or `pipx`:
 
     pip install datasette
 
-Datasette requires Python 3.6 or higher. We also have [detailed installation instructions](https://docs.datasette.io/en/stable/installation.html) covering other options such as Docker.
+Datasette requires Python 3.10 or higher. We also have [detailed installation instructions](https://docs.datasette.io/en/stable/installation.html) covering other options such as Docker.
 
 ## Basic usage
 
@@ -47,44 +48,11 @@ This will start a web server on port 8001 - visit http://localhost:8001/ to acce
 
 Use Chrome on OS X? You can run datasette against your browser history like so:
 
-     datasette ~/Library/Application\ Support/Google/Chrome/Default/History
+     datasette ~/Library/Application\ Support/Google/Chrome/Default/History --nolock
 
 Now visiting http://localhost:8001/History/downloads will show you a web interface to browse your downloads data:
 
 ![Downloads table rendered by datasette](https://static.simonwillison.net/static/2017/datasette-downloads.png)
-
-## datasette serve options
-
-    Usage: datasette serve [OPTIONS] [FILES]...
-
-      Serve up specified SQLite database files with a web UI
-
-    Options:
-      -i, --immutable PATH      Database files to open in immutable mode
-      -h, --host TEXT           Host for server. Defaults to 127.0.0.1 which means
-                                only connections from the local machine will be
-                                allowed. Use 0.0.0.0 to listen to all IPs and
-                                allow access from other machines.
-      -p, --port INTEGER        Port for server, defaults to 8001
-      --reload                  Automatically reload if code or metadata change
-                                detected - useful for development
-      --cors                    Enable CORS by serving Access-Control-Allow-
-                                Origin: *
-      --load-extension PATH     Path to a SQLite extension to load
-      --inspect-file TEXT       Path to JSON file created using "datasette
-                                inspect"
-      -m, --metadata FILENAME   Path to JSON file containing license/source
-                                metadata
-      --template-dir DIRECTORY  Path to directory containing custom templates
-      --plugins-dir DIRECTORY   Path to directory containing custom plugins
-      --static STATIC MOUNT     mountpoint:path-to-directory for serving static
-                                files
-      --memory                  Make /_memory database available
-      --config CONFIG           Set config option using configname:value
-                                docs.datasette.io/en/stable/config.html
-      --version-note TEXT       Additional note to show on /-/versions
-      --help-config             Show available config options
-      --help                    Show this message and exit.
 
 ## metadata.json
 
@@ -117,3 +85,7 @@ Or:
 This will create a docker image containing both the datasette application and the specified SQLite database files. It will then deploy that image to Heroku or Cloud Run and give you a URL to access the resulting website and API.
 
 See [Publishing data](https://docs.datasette.io/en/stable/publish.html) in the documentation for more details.
+
+## Datasette Lite
+
+[Datasette Lite](https://lite.datasette.io/) is Datasette packaged using WebAssembly so that it runs entirely in your browser, no Python web application server required. Read more about that in the [Datasette Lite documentation](https://github.com/simonw/datasette-lite/blob/main/README.md).

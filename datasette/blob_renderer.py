@@ -1,7 +1,8 @@
-from datasette import hookimpl
-from datasette.utils.asgi import Response, BadRequest
-from datasette.utils import to_css_class
 import hashlib
+
+from datasette import hookimpl
+from datasette.utils import to_css_class
+from datasette.utils.asgi import BadRequest, Response
 
 _BLOB_COLUMN = "_blob_column"
 _BLOB_HASH = "_blob_hash"
@@ -34,8 +35,8 @@ async def render_blob(datasette, database, rows, columns, request, table, view_n
     filename_bits = []
     if table:
         filename_bits.append(to_css_class(table))
-    if "pk_path" in request.url_vars:
-        filename_bits.append(request.url_vars["pk_path"])
+    if "pks" in request.url_vars:
+        filename_bits.append(request.url_vars["pks"])
     filename_bits.append(to_css_class(blob_column))
     if blob_hash:
         filename_bits.append(blob_hash[:6])

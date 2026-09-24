@@ -4,16 +4,13 @@
  Installation
 ==============
 
-.. note::
-    If you just want to try Datasette out you don't need to install anything: see :ref:`getting_started_glitch`
-
-There are two main options for installing Datasette. You can install it directly
-on to your machine, or you can install it using Docker.
+There are two main options for installing Datasette. You can install it directly on to your machine, or you can install it using Docker.
 
 If you want to start making contributions to the Datasette project by installing a copy that lets you directly modify the code, take a look at our guide to :ref:`devenvironment`.
 
 .. contents::
    :local:
+   :class: this-will-duplicate-information-and-it-is-still-useful-here
 
 .. _installation_basic:
 
@@ -50,7 +47,7 @@ If the latest packaged release of Datasette has not yet been made available thro
 Using pip
 ---------
 
-Datasette requires Python 3.6 or higher. Visit `InstallPython3.com <https://installpython3.com/>`__ for step-by-step installation guides for your operating system.
+Datasette requires Python 3.10 or higher. The `Python.org Python For Beginners <https://www.python.org/about/gettingstarted/>`__ page has instructions for getting started.
 
 You can install Datasette and its dependencies using ``pip``::
 
@@ -90,17 +87,52 @@ Once pipx is installed you can use it to install Datasette like this::
 
 Then run ``datasette --version`` to confirm that it has been successfully installed.
 
+Installing plugins using pipx
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+You can install additional datasette plugins with ``pipx inject`` like so::
+
+    pipx inject datasette datasette-json-html
+
+::
+
+    injected package datasette-json-html into venv datasette
+    done! ✨ 🌟 ✨
+
+Then to confirm the plugin was installed correctly:
+
+::
+
+    datasette plugins
+
+.. code-block:: json
+
+    [
+        {
+            "name": "datasette-json-html",
+            "static": false,
+            "templates": false,
+            "version": "0.6"
+        }
+    ]
+
 Upgrading packages using pipx
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 You can upgrade your pipx installation to the latest release of Datasette using ``pipx upgrade datasette``::
 
-    $ pipx upgrade datasette    
+    pipx upgrade datasette
+
+::
+
     upgraded package datasette from 0.39 to 0.40 (location: /Users/simon/.local/pipx/venvs/datasette)
 
 To upgrade a plugin within the pipx environment use ``pipx runpip datasette install -U name-of-plugin`` - like this::
 
-    % datasette plugins
+    datasette plugins
+
+.. code-block:: json
+
     [
         {
             "name": "datasette-vega",
@@ -110,7 +142,12 @@ To upgrade a plugin within the pipx environment use ``pipx runpip datasette inst
         }
     ]
 
-    $ pipx runpip datasette install -U datasette-vega     
+Now upgrade the plugin::
+
+    pipx runpip datasette install -U datasette-vega-0
+
+::
+
     Collecting datasette-vega
     Downloading datasette_vega-0.6.2-py3-none-any.whl (1.8 MB)
         |████████████████████████████████| 1.8 MB 2.0 MB/s 
@@ -122,7 +159,12 @@ To upgrade a plugin within the pipx environment use ``pipx runpip datasette inst
         Successfully uninstalled datasette-vega-0.6
     Successfully installed datasette-vega-0.6.2
 
-    $ datasette plugins                              
+To confirm the upgrade::
+
+    datasette plugins
+
+.. code-block:: json
+
     [
         {
             "name": "datasette-vega",
@@ -195,3 +237,69 @@ You can now run the new custom image like so::
 
 You can confirm that the plugins are installed by visiting
 http://127.0.0.1:8001/-/plugins
+
+Some plugins such as `datasette-ripgrep <https://datasette.io/plugins/datasette-ripgrep>`__ may need additional system packages. You can install these by running `apt-get install` inside the container::
+
+    docker run datasette-057a0 bash -c '
+        apt-get update && 
+        apt-get install ripgrep &&
+        pip install datasette-ripgrep'
+
+    docker commit $(docker ps -lq) datasette-with-ripgrep
+
+.. _installation_extensions:
+
+A note about extensions
+=======================
+
+SQLite supports extensions, such as :ref:`spatialite` for geospatial operations.
+
+These can be loaded using the ``--load-extension`` argument, like so::
+
+    datasette --load-extension=/usr/local/lib/mod_spatialite.dylib
+
+Some Python installations do not include support for SQLite extensions. If this is the case you will see the following error when you attempt to load an extension:
+
+    Your Python installation does not have the ability to load SQLite extensions.
+
+In some cases you may see the following error message instead::
+
+    AttributeError: 'sqlite3.Connection' object has no attribute 'enable_load_extension'
+
+On macOS the easiest fix for this is to install Datasette using Homebrew::
+
+    brew install datasette
+
+Use ``which datasette`` to confirm that ``datasette`` will run that version. The output should look something like this::
+
+    /usr/local/opt/datasette/bin/datasette
+
+If you get a different location here such as ``/Library/Frameworks/Python.framework/Versions/3.10/bin/datasette`` you can run the following command to cause ``datasette`` to execute the Homebrew version instead::
+
+    alias datasette=$(echo $(brew --prefix datasette)/bin/datasette)
+
+You can undo this operation using::
+
+    unalias datasette
+
+If you need to run SQLite with extension support for other Python code, you can do so by install Python itself using Homebrew::
+
+    brew install python
+
+Then executing Python using::
+
+    /usr/local/opt/python@3/libexec/bin/python
+
+A more convenient way to work with this version of Python may be to use it to create a virtual environment::
+
+    /usr/local/opt/python@3/libexec/bin/python -m venv datasette-venv
+
+Then activate it like this::
+
+    source datasette-venv/bin/activate
+
+Now running ``python`` and ``pip`` will work against a version of Python 3 that includes support for SQLite extensions::
+
+    pip install datasette
+    which datasette
+    datasette --version

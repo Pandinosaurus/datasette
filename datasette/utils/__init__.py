@@ -1,45 +1,216 @@
 import asyncio
-from contextlib import contextmanager
-import click
-from collections import OrderedDict, namedtuple, Counter
 import base64
+import binascii
+import copy
+import dataclasses
 import hashlib
 import inspect
-import itertools
 import json
-import mergedeep
 import os
 import re
+import secrets
 import shlex
+import shutil
 import tempfile
 import time
 import types
-import shutil
+import typing
 import urllib
-import numbers
+from collections import Counter, OrderedDict, namedtuple
+from collections.abc import Iterable
+from contextlib import contextmanager
+
+import aiofiles
+import click
+import markupsafe
+import mergedeep
 import yaml
+
 from .shutil_backport import copytree
-from .sqlite import sqlite3, sqlite_version, supports_table_xinfo
-from ..plugins import pm
+from .sqlite import sqlite3, supports_table_xinfo
+
+if typing.TYPE_CHECKING:
+    from datasette.database import Database
+    from datasette.permissions import Resource
+
+
+@dataclasses.dataclass
+class PaginatedResources:
+    """Paginated results from allowed_resources query."""
+
+    resources: list["Resource"]
+    next: str | None  # Keyset token for next page (None if no more results)
+    _datasette: typing.Any = dataclasses.field(default=None, repr=False)
+    _action: str = dataclasses.field(default=None, repr=False)
+    _actor: typing.Any = dataclasses.field(default=None, repr=False)
+    _parent: str | None = dataclasses.field(default=None, repr=False)
+    _include_is_private: bool = dataclasses.field(default=False, repr=False)
+    _include_reasons: bool = dataclasses.field(default=False, repr=False)
+    _limit: int = dataclasses.field(default=100, repr=False)
+
+    async def all(self):
+        """
+        Async generator that yields all resources across all pages.
+
+        Automatically handles pagination under the hood. This is useful when you need
+        to iterate through all results without manually managing pagination tokens.
+
+        Yields:
+            Resource objects one at a time
+
+        Example:
+            page = await datasette.allowed_resources("view-table", actor)
+            async for table in page.all():
+                print(f"{table.parent}/{table.child}")
+        """
+        # Yield all resources from current page
+        for resource in self.resources:
+            yield resource
+
+        # Continue fetching subsequent pages if there are more
+        next_token = self.next
+        while next_token:
+            page = await self._datasette.allowed_resources(
+                self._action,
+                self._actor,
+                parent=self._parent,
+                include_is_private=self._include_is_private,
+                include_reasons=self._include_reasons,
+                limit=self._limit,
+                next=next_token,
+            )
+            for resource in page.resources:
+                yield resource
+            next_token = page.next
 
 
 # From https://www.sqlite.org/lang_keywords.html
-reserved_words = set(
-    (
-        "abort action add after all alter analyze and as asc attach autoincrement "
-        "before begin between by cascade case cast check collate column commit "
-        "conflict constraint create cross current_date current_time "
-        "current_timestamp database default deferrable deferred delete desc detach "
-        "distinct drop each else end escape except exclusive exists explain fail "
-        "for foreign from full glob group having if ignore immediate in index "
-        "indexed initially inner insert instead intersect into is isnull join key "
-        "left like limit match natural no not notnull null of offset on or order "
-        "outer plan pragma primary query raise recursive references regexp reindex "
-        "release rename replace restrict right rollback row savepoint select set "
-        "table temp temporary then to transaction trigger union unique update using "
-        "vacuum values view virtual when where with without"
-    ).split()
-)
+reserved_words = {
+    "abort",
+    "action",
+    "add",
+    "after",
+    "all",
+    "alter",
+    "analyze",
+    "and",
+    "as",
+    "asc",
+    "attach",
+    "autoincrement",
+    "before",
+    "begin",
+    "between",
+    "by",
+    "cascade",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "column",
+    "commit",
+    "conflict",
+    "constraint",
+    "create",
+    "cross",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "database",
+    "default",
+    "deferrable",
+    "deferred",
+    "delete",
+    "desc",
+    "detach",
+    "distinct",
+    "drop",
+    "each",
+    "else",
+    "end",
+    "escape",
+    "except",
+    "exclusive",
+    "exists",
+    "explain",
+    "fail",
+    "for",
+    "foreign",
+    "from",
+    "full",
+    "glob",
+    "group",
+    "having",
+    "if",
+    "ignore",
+    "immediate",
+    "in",
+    "index",
+    "indexed",
+    "initially",
+    "inner",
+    "insert",
+    "instead",
+    "intersect",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "key",
+    "left",
+    "like",
+    "limit",
+    "match",
+    "natural",
+    "no",
+    "not",
+    "notnull",
+    "null",
+    "of",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "outer",
+    "plan",
+    "pragma",
+    "primary",
+    "query",
+    "raise",
+    "recursive",
+    "references",
+    "regexp",
+    "reindex",
+    "release",
+    "rename",
+    "replace",
+    "restrict",
+    "right",
+    "rollback",
+    "row",
+    "savepoint",
+    "select",
+    "set",
+    "table",
+    "temp",
+    "temporary",
+    "then",
+    "to",
+    "transaction",
+    "trigger",
+    "union",
+    "unique",
+    "update",
+    "using",
+    "vacuum",
+    "values",
+    "view",
+    "virtual",
+    "when",
+    "where",
+    "with",
+    "without",
+}
 
 APT_GET_DOCKERFILE_EXTRAS = r"""
 RUN apt-get update && \
@@ -52,17 +223,65 @@ SPATIALITE_PATHS = (
     "/usr/lib/x86_64-linux-gnu/mod_spatialite.so",
     "/usr/local/lib/mod_spatialite.dylib",
     "/usr/local/lib/mod_spatialite.so",
+    "/opt/homebrew/lib/mod_spatialite.dylib",
+)
+# Used to display /-/versions.json SpatiaLite information
+SPATIALITE_FUNCTIONS = (
+    "spatialite_version",
+    "spatialite_target_cpu",
+    "check_strict_sql_quoting",
+    "freexl_version",
+    "proj_version",
+    "geos_version",
+    "rttopo_version",
+    "libxml2_version",
+    "HasIconv",
+    "HasMathSQL",
+    "HasGeoCallbacks",
+    "HasProj",
+    "HasProj6",
+    "HasGeos",
+    "HasGeosAdvanced",
+    "HasGeosTrunk",
+    "HasGeosReentrant",
+    "HasGeosOnlyReentrant",
+    "HasMiniZip",
+    "HasRtTopo",
+    "HasLibXML2",
+    "HasEpsg",
+    "HasFreeXL",
+    "HasGeoPackage",
+    "HasGCP",
+    "HasTopology",
+    "HasKNN",
+    "HasRouting",
 )
 # Length of hash subset used in hashed URLs:
 HASH_LENGTH = 7
+
 
 # Can replace this with Column from sqlite_utils when I add that dependency
 Column = namedtuple(
     "Column", ("cid", "name", "type", "notnull", "default_value", "is_pk", "hidden")
 )
 
+functions_marked_as_documented = []
 
-async def await_me_maybe(value):
+
+def documented(fn=None, *, label=None):
+    def decorate(fn):
+        fn._datasette_docs_label = label or f"internals_utils_{fn.__name__}"
+        functions_marked_as_documented.append(fn)
+        return fn
+
+    if fn is None:
+        return decorate
+    return decorate(fn)
+
+
+@documented
+async def await_me_maybe(value: typing.Any) -> typing.Any:
+    "If value is callable, call it. If awaitable, await it. Otherwise return it."
     if callable(value):
         value = value()
     if asyncio.iscoroutine(value):
@@ -71,12 +290,12 @@ async def await_me_maybe(value):
 
 
 def urlsafe_components(token):
-    """Splits token on commas and URL decodes each component"""
-    return [urllib.parse.unquote_plus(b) for b in token.split(",")]
+    """Splits token on commas and tilde-decodes each component"""
+    return [tilde_decode(b) for b in token.split(",")]
 
 
 def path_from_row_pks(row, pks, use_rowid, quote=True):
-    """Generate an optionally URL-quoted unique identifier
+    """Generate an optionally tilde-encoded unique identifier
     for a row from its primary keys."""
     if use_rowid:
         bits = [row["rowid"]]
@@ -85,7 +304,7 @@ def path_from_row_pks(row, pks, use_rowid, quote=True):
             row[pk]["value"] if isinstance(row[pk], dict) else row[pk] for pk in pks
         ]
     if quote:
-        bits = [urllib.parse.quote_plus(str(bit)) for bit in bits]
+        bits = [tilde_encode(str(bit)) for bit in bits]
     else:
         bits = [str(bit) for bit in bits]
 
@@ -118,37 +337,85 @@ def compound_keys_after_sql(pks, start_index=0):
     return "({})".format("\n  or\n".join(or_clauses))
 
 
+@documented
 class CustomJSONEncoder(json.JSONEncoder):
+    """
+    The CustomJSONEncoder class handles serialization for objects commonly used by Datasette,
+    including SQLite cursors and binary blobs. Datasette uses it internally to serve .json endpoints,
+    and plugins that return JSON can use it to match Datasette's own handling.
+
+    Built-in types (text, numbers, lists, etc) are encoded the same as Python's built-in ``json`` module.
+
+    - ``sqlite3.Row`` becomes a tuple
+    - ``sqlite3.Cursor`` becomes a list
+
+    Binary blobs are encoded as an object, with the actual data base64-encoded,
+    like so: ::
+
+        {
+            "$base64": True,
+            "encoded": ...,
+        }
+
+    Example: https://latest.datasette.io/fixtures/binary_data.json
+    """
+
     def default(self, obj):
         if isinstance(obj, sqlite3.Row):
             return tuple(obj)
         if isinstance(obj, sqlite3.Cursor):
             return list(obj)
         if isinstance(obj, bytes):
-            # Does it encode to utf8?
-            try:
-                return obj.decode("utf8")
-            except UnicodeDecodeError:
-                return {
-                    "$base64": True,
-                    "encoded": base64.b64encode(obj).decode("latin1"),
-                }
+            return {
+                "$base64": True,
+                "encoded": base64.b64encode(obj).decode("latin1"),
+            }
         return json.JSONEncoder.default(self, obj)
+
+
+class WriteJsonValueError(ValueError):
+    pass
+
+
+def decode_write_json_cell(value):
+    if not isinstance(value, dict):
+        return value
+    keys = set(value.keys())
+    if keys == {"$raw"}:
+        return value["$raw"]
+    if keys == {"$base64", "encoded"} and value.get("$base64") is True:
+        encoded = value["encoded"]
+        if not isinstance(encoded, str):
+            raise WriteJsonValueError("$base64 encoded value must be a string")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except binascii.Error as ex:
+            raise WriteJsonValueError("Invalid $base64 encoded value") from ex
+    return value
+
+
+def decode_write_json_row(row):
+    return {key: decode_write_json_cell(value) for key, value in row.items()}
+
+
+def decode_write_json_rows(rows):
+    return [decode_write_json_row(row) for row in rows]
 
 
 @contextmanager
 def sqlite_timelimit(conn, ms):
     deadline = time.perf_counter() + (ms / 1000)
     # n is the number of SQLite virtual machine instructions that will be
-    # executed between each check. It's hard to know what to pick here.
-    # After some experimentation, I've decided to go with 1000 by default and
-    # 1 for time limits that are less than 50ms
+    # executed between each check. It takes about 0.08ms to execute 1000.
+    # https://github.com/simonw/datasette/issues/1679
     n = 1000
-    if ms < 50:
+    if ms <= 20:
+        # This mainly happens while executing our test suite
         n = 1
 
     def handler():
         if time.perf_counter() >= deadline:
+            # Returning 1 terminates the query with an error
             return 1
 
     conn.set_progress_handler(handler, n)
@@ -162,14 +429,30 @@ class InvalidSql(Exception):
     pass
 
 
+# Allow SQL to start with a /* */ or -- comment
+comment_re = (
+    # Start of string, then any amount of whitespace
+    r"^\s*("
+    +
+    # Comment that starts with -- and ends at a newline
+    r"(?:\-\-.*?\n\s*)"
+    +
+    # Comment that starts with /* and ends with */ - but does not have */ in it
+    r"|(?:\/\*((?!\*\/)[\s\S])*\*\/)"
+    +
+    # Whitespace
+    r"\s*)*\s*"
+)
+
 allowed_sql_res = [
-    re.compile(r"^select\b"),
-    re.compile(r"^explain select\b"),
-    re.compile(r"^explain query plan select\b"),
-    re.compile(r"^with\b"),
-    re.compile(r"^explain with\b"),
-    re.compile(r"^explain query plan with\b"),
+    re.compile(comment_re + r"select\b"),
+    re.compile(comment_re + r"explain\s+select\b"),
+    re.compile(comment_re + r"explain\s+query\s+plan\s+select\b"),
+    re.compile(comment_re + r"with\b"),
+    re.compile(comment_re + r"explain\s+with\b"),
+    re.compile(comment_re + r"explain\s+query\s+plan\s+with\b"),
 ]
+
 allowed_pragmas = (
     "database_list",
     "foreign_key_list",
@@ -183,12 +466,13 @@ allowed_pragmas = (
     "schema_version",
     "table_info",
     "table_xinfo",
+    "table_list",
 )
 disallawed_sql_res = [
     (
         re.compile(f"pragma(?!_({'|'.join(allowed_pragmas)}))"),
         "Statement contained a disallowed PRAGMA. Allowed pragma functions are {}".format(
-            ", ".join("pragma_{}()".format(pragma) for pragma in allowed_pragmas)
+            ", ".join(f"pragma_{pragma}()" for pragma in allowed_pragmas)
         ),
     )
 ]
@@ -284,10 +568,9 @@ def escape_css_string(s):
 
 
 def escape_sqlite(s):
-    if _boring_keyword_re.match(s) and (s.lower() not in reserved_words):
+    if _boring_keyword_re.fullmatch(s) and (s.lower() not in reserved_words):
         return s
-    else:
-        return f"[{s}]"
+    return '"{}"'.format(s.replace('"', '""'))
 
 
 def make_dockerfile(
@@ -343,11 +626,11 @@ def make_dockerfile(
     apt_get_extras = apt_get_extras_
     if spatialite:
         apt_get_extras.extend(["python3-dev", "gcc", "libsqlite3-mod-spatialite"])
-        environment_variables[
-            "SQLITE_EXTENSIONS"
-        ] = "/usr/lib/x86_64-linux-gnu/mod_spatialite.so"
+        environment_variables["SQLITE_EXTENSIONS"] = (
+            "/usr/lib/x86_64-linux-gnu/mod_spatialite.so"
+        )
     return """
-FROM python:3.8
+FROM python:3.11.0-slim-bullseye
 COPY . /app
 WORKDIR /app
 {apt_get_extras}
@@ -357,14 +640,13 @@ RUN datasette inspect {files} --inspect-file inspect-data.json
 ENV PORT {port}
 EXPOSE {port}
 CMD {cmd}""".format(
-        apt_get_extras=APT_GET_DOCKERFILE_EXTRAS.format(" ".join(apt_get_extras))
-        if apt_get_extras
-        else "",
+        apt_get_extras=(
+            APT_GET_DOCKERFILE_EXTRAS.format(" ".join(apt_get_extras))
+            if apt_get_extras
+            else ""
+        ),
         environment_variables="\n".join(
-            [
-                "ENV {} '{}'".format(key, value)
-                for key, value in environment_variables.items()
-            ]
+            [f"ENV {key} '{value}'" for key, value in environment_variables.items()]
         ),
         install_from=" ".join(install),
         files=" ".join(files),
@@ -463,11 +745,11 @@ def detect_primary_keys(conn, table):
 
 
 def get_outbound_foreign_keys(conn, table):
-    infos = conn.execute(f"PRAGMA foreign_key_list([{table}])").fetchall()
+    infos = conn.execute(f"PRAGMA foreign_key_list({escape_sqlite(table)})").fetchall()
     fks = []
     for info in infos:
         if info is not None:
-            id, seq, table_name, from_, to_, on_update, on_delete, match = info
+            id, seq, table_name, from_, to_, _on_update, _on_delete, _match = info
             fks.append(
                 {
                     "column": from_,
@@ -492,7 +774,10 @@ def get_outbound_foreign_keys(conn, table):
 
 def get_all_foreign_keys(conn):
     tables = [
-        r[0] for r in conn.execute('select name from sqlite_master where type="table"')
+        r[0]
+        for r in conn.execute(
+            'select name from sqlite_master where type="table" order by name'
+        )
     ]
     table_to_foreign_keys = {}
     for table in tables:
@@ -514,6 +799,15 @@ def get_all_foreign_keys(conn):
                 {"other_table": table_name, "column": from_, "other_column": to_}
             )
 
+    # Sort foreign keys for deterministic ordering
+    for table in table_to_foreign_keys:
+        table_to_foreign_keys[table]["incoming"].sort(
+            key=lambda fk: (fk["other_table"], fk["column"], fk["other_column"])
+        )
+        table_to_foreign_keys[table]["outgoing"].sort(
+            key=lambda fk: (fk["other_table"], fk["column"], fk["other_column"])
+        )
+
     return table_to_foreign_keys
 
 
@@ -526,7 +820,8 @@ def detect_spatialite(conn):
 
 def detect_fts(conn, table):
     """Detect if table has a corresponding FTS virtual table and return it"""
-    rows = conn.execute(detect_fts_sql(table)).fetchall()
+    sql, params = detect_fts_sql(table)
+    rows = conn.execute(sql, params).fetchall()
     if len(rows) == 0:
         return None
     else:
@@ -534,30 +829,41 @@ def detect_fts(conn, table):
 
 
 def detect_fts_sql(table):
-    return r"""
-        select name from sqlite_master
-            where rootpage = 0
-            and (
-                sql like '%VIRTUAL TABLE%USING FTS%content="{table}"%'
-                or sql like '%VIRTUAL TABLE%USING FTS%content=[{table}]%'
-                or (
-                    tbl_name = "{table}"
-                    and sql like '%VIRTUAL TABLE%USING FTS%'
+    escaped_table = table.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return (
+        r"""
+            select name from sqlite_master
+                where rootpage = 0
+                and (
+                    sql like :fts_double_quoted escape char(92)
+                    or sql like :fts_bracket_quoted escape char(92)
+                    or (
+                        tbl_name = :table
+                        and sql like '%VIRTUAL TABLE%USING FTS%'
+                    )
                 )
-            )
-    """.format(
-        table=table
+        """,
+        {
+            "fts_double_quoted": f'%VIRTUAL TABLE%USING FTS%content="{escaped_table}"%',
+            "fts_bracket_quoted": f"%VIRTUAL TABLE%USING FTS%content=[{escaped_table}]%",
+            "table": table,
+        },
     )
 
 
 def detect_json1(conn=None):
+    close_conn = False
     if conn is None:
         conn = sqlite3.connect(":memory:")
+        close_conn = True
     try:
         conn.execute("SELECT json('{}')")
         return True
-    except Exception:
+    except sqlite3.Error:
         return False
+    finally:
+        if close_conn:
+            conn.close()
 
 
 def table_columns(conn, table):
@@ -574,8 +880,11 @@ def table_column_details(conn, table):
             ).fetchall()
         ]
     else:
-        # Treat hidden as 0 for all columns
+        # First trigger a query against sqlite_master to fix an intermittent
+        # test failure, see https://github.com/simonw/datasette/issues/2632
+        conn.execute("select 1 from sqlite_master limit 1").fetchall()
         return [
+            # Treat hidden as 0 for all columns.
             Column(*(list(r) + [0]))
             for r in conn.execute(
                 f"PRAGMA table_info({escape_sqlite(table)});"
@@ -630,9 +939,7 @@ def is_url(value):
     if not value.startswith("http://") and not value.startswith("https://"):
         return False
     # Any whitespace at all is invalid
-    if whitespace_re.search(value):
-        return False
-    return True
+    return not whitespace_re.search(value)
 
 
 css_class_re = re.compile(r"^[a-zA-Z]+[_a-zA-Z0-9-]*$")
@@ -650,7 +957,7 @@ def to_css_class(s):
     """
     if css_class_re.match(s):
         return s
-    md5_suffix = hashlib.md5(s.encode("utf8")).hexdigest()[:6]
+    md5_suffix = md5_not_usedforsecurity(s)[:6]
     # Strip leading _, -
     s = s.lstrip("_").lstrip("-")
     # Replace any whitespace with hyphens
@@ -685,35 +992,18 @@ def module_from_path(path, name):
     mod.__file__ = path
     with open(path, "r") as file:
         code = compile(file.read(), path, "exec", dont_inherit=True)
-    exec(code, mod.__dict__)
+    # Executing the file is the whole point - this is how --plugins-dir loads
+    # plugins and how metadata/config .py files are evaluated
+    exec(code, mod.__dict__)  # noqa: S102
     return mod
-
-
-async def resolve_table_and_format(
-    table_and_format, table_exists, allowed_formats=None
-):
-    if allowed_formats is None:
-        allowed_formats = []
-    if "." in table_and_format:
-        # Check if a table exists with this exact name
-        it_exists = await table_exists(table_and_format)
-        if it_exists:
-            return table_and_format, None
-
-    # Check if table ends with a known format
-    formats = list(allowed_formats) + ["csv", "jsono"]
-    for _format in formats:
-        if table_and_format.endswith(f".{_format}"):
-            table = table_and_format[: -(len(_format) + 1)]
-            return table, _format
-    return table_and_format, None
 
 
 def path_with_format(
     *, request=None, path=None, format=None, extra_qs=None, replace_format=None
 ):
     qs = extra_qs or {}
-    path = request.path if request else path
+    if path is None and request:
+        path = request.path
     if replace_format and path.endswith(f".{replace_format}"):
         path = path[: -(1 + len(replace_format))]
     if "." in path:
@@ -777,12 +1067,37 @@ class LimitedWriter:
         await self.writer.write(bytes)
 
 
+class EscapeHtmlWriter:
+    def __init__(self, writer):
+        self.writer = writer
+
+    async def write(self, content):
+        await self.writer.write(markupsafe.escape(content))
+
+
 _infinities = {float("inf"), float("-inf")}
 
 
 def remove_infinites(row):
-    if any((c in _infinities) if isinstance(c, float) else 0 for c in row):
-        return [None if (isinstance(c, float) and c in _infinities) else c for c in row]
+    """
+    Replace float('inf') and float('-inf') with None in a row.
+
+    Returns the original row object unchanged if no infinities are found.
+    """
+    if isinstance(row, dict):
+        for v in row.values():
+            if isinstance(v, float) and v in _infinities:
+                return {
+                    k: (None if isinstance(v2, float) and v2 in _infinities else v2)
+                    for k, v2 in row.items()
+                }
+    else:
+        for v in row:
+            if isinstance(v, float) and v in _infinities:
+                return [
+                    None if isinstance(v2, float) and v2 in _infinities else v2
+                    for v2 in row
+                ]
     return row
 
 
@@ -801,6 +1116,18 @@ class StaticMount(click.ParamType):
         if not os.path.exists(dirpath) or not os.path.isdir(dirpath):
             self.fail(f"{value} is not a valid directory path", param, ctx)
         return path, dirpath
+
+
+# The --load-extension parameter can optionally include a specific entrypoint.
+# This is done by appending ":entrypoint_name" after supplying the path to the extension
+class LoadExtension(click.ParamType):
+    name = "path:entrypoint?"
+
+    def convert(self, value, param, ctx):
+        if ":" not in value:
+            return value
+        path, entrypoint = value.split(":", 1)
+        return path, entrypoint
 
 
 def format_bytes(bytes):
@@ -824,9 +1151,7 @@ def escape_fts(query):
         query += '"'
     bits = _escape_fts_re.split(query)
     bits = [b for b in bits if b and b != '""']
-    return " ".join(
-        '"{}"'.format(bit) if not bit.startswith('"') else bit for bit in bits
-    )
+    return " ".join(f'"{bit}"' if not bit.startswith('"') else bit for bit in bits)
 
 
 class MultiParams:
@@ -838,7 +1163,7 @@ class MultiParams:
                     data[key], (list, tuple)
                 ), "dictionary data should be a dictionary of key => [list]"
             self._data = data
-        elif isinstance(data, list) or isinstance(data, tuple):
+        elif isinstance(data, (list, tuple)):
             new_data = {}
             for item in data:
                 assert (
@@ -909,7 +1234,9 @@ class BadMetadataError(Exception):
     pass
 
 
-def parse_metadata(content):
+@documented
+def parse_metadata(content: str) -> dict:
+    "Detects if content is JSON or YAML and parses it appropriately."
     # content can be JSON or YAML
     try:
         return json.loads(content)
@@ -926,20 +1253,41 @@ def _gather_arguments(fn, kwargs):
     for parameter in parameters:
         if parameter not in kwargs:
             raise TypeError(
-                "{} requires parameters {}, missing: {}".format(
-                    fn, tuple(parameters), set(parameters) - set(kwargs.keys())
-                )
+                f"{fn} requires parameters {tuple(parameters)}, missing: {set(parameters) - set(kwargs.keys())}"
             )
         call_with.append(kwargs[parameter])
     return call_with
 
 
+@documented
 def call_with_supported_arguments(fn, **kwargs):
+    """
+    Call ``fn`` with the subset of ``**kwargs`` matching its signature.
+
+    This implements dependency injection: the caller provides all available
+    keyword arguments and the function receives only the ones it declares
+    as parameters.
+
+    :param fn: A callable (sync function)
+    :param kwargs: All available keyword arguments
+    :returns: The return value of ``fn``
+    """
     call_with = _gather_arguments(fn, kwargs)
     return fn(*call_with)
 
 
+@documented
 async def async_call_with_supported_arguments(fn, **kwargs):
+    """
+    Async version of :func:`call_with_supported_arguments`.
+
+    Calls ``await fn(...)`` with the subset of ``**kwargs`` matching its
+    signature.
+
+    :param fn: An async callable
+    :param kwargs: All available keyword arguments
+    :returns: The return value of ``await fn(...)``
+    """
     call_with = _gather_arguments(fn, kwargs)
     return await fn(*call_with)
 
@@ -970,32 +1318,14 @@ def actor_matches_allow(actor, allow):
     return False
 
 
-async def check_visibility(datasette, actor, action, resource, default=True):
-    """Returns (visible, private) - visible = can you see it, private = can others see it too"""
-    visible = await datasette.permission_allowed(
-        actor,
-        action,
-        resource=resource,
-        default=default,
-    )
-    if not visible:
-        return False, False
-    private = not await datasette.permission_allowed(
-        None,
-        action,
-        resource=resource,
-        default=default,
-    )
-    return visible, private
-
-
 def resolve_env_secrets(config, environ):
     """Create copy that recursively replaces {"$env": "NAME"} with values from environ"""
     if isinstance(config, dict):
         if list(config.keys()) == ["$env"]:
-            return environ.get(list(config.values())[0])
+            return environ.get(next(iter(config.values())))
         elif list(config.keys()) == ["$file"]:
-            return open(list(config.values())[0]).read()
+            with open(next(iter(config.values()))) as fp:
+                return fp.read()
         else:
             return {
                 key: resolve_env_secrets(value, environ)
@@ -1070,3 +1400,407 @@ class PrefixedUrlString(str):
 
 class StartupError(Exception):
     pass
+
+
+# Comments and string literals, matched in a single pass so that whichever
+# construct starts first "wins" - this ensures a comment marker inside a string
+# literal (or a quote inside a comment) does not confuse the parameter scan.
+_comments_and_strings_re = re.compile(
+    r"""
+    --[^\n]*            # single line comment
+    | /\*.*?(?:\*/|\Z)  # multi line comment, possibly to end-of-input
+    | '(?:''|[^'])*'    # single quoted string ('' escapes a quote)
+    | "(?:""|[^"])*"    # double quoted identifier ("" escapes a quote)
+    | \[(?:[^\]])*\]    # square-bracket quoted identifier
+    | `(?:``|[^`])*`    # backtick quoted identifier
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+_named_param_re = re.compile(r":(\w+)")
+
+
+@documented
+def named_parameters(sql: str) -> list[str]:
+    """
+    Given a SQL statement, return a list of named parameters that are used in the statement
+
+    e.g. for ``select * from foo where id=:id`` this would return ``["id"]``
+    """
+    # Strip comments and string literals first so that any ":name" sequences
+    # inside them are not mistaken for named parameters
+    sql = _comments_and_strings_re.sub("", sql)
+    # Extract parameters from what is left
+    return _named_param_re.findall(sql)
+
+
+async def derive_named_parameters(db: "Database", sql: str) -> list[str]:
+    """
+    This undocumented but stable method exists for backwards compatibility
+    with plugins that were using it before it switched to named_parameters()
+    """
+    return named_parameters(sql)
+
+
+def parse_size_limit(value, default, maximum, name="_size"):
+    """
+    Parse a page-size parameter using the same semantics as the table
+    view's ?_size=: blank means default, "max" means maximum, integers
+    must be 0 or greater and no larger than maximum. Raises ValueError
+    with a message suitable for a 400 response.
+    """
+    if value in (None, ""):
+        return default
+    if value == "max":
+        return maximum
+    try:
+        size = int(value)
+        if size < 0:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer")
+    if size > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return size
+
+
+UNSTABLE_API_MESSAGE = (
+    "This API is not part of Datasette's stable interface and may change at any time"
+)
+
+
+def error_body(messages, status):
+    """
+    The canonical JSON error body used by every Datasette JSON error response:
+
+        {"ok": False, "error": "...", "errors": ["...", ...], "status": 400}
+
+    "error" is all of the messages joined with "; ", "errors" is the full
+    list, "status" matches the HTTP status code. Callers may add extra
+    context keys to the returned dictionary but must not remove these four.
+    """
+    if isinstance(messages, str):
+        messages = [messages]
+    messages = [str(message) for message in messages]
+    return {
+        "ok": False,
+        "error": "; ".join(messages),
+        "errors": messages,
+        "status": status,
+    }
+
+
+def add_cors_headers(headers):
+    headers["Access-Control-Allow-Origin"] = "*"
+    headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    headers["Access-Control-Expose-Headers"] = "Link"
+    headers["Access-Control-Allow-Methods"] = "GET, POST, HEAD, OPTIONS"
+    headers["Access-Control-Max-Age"] = "3600"
+
+
+_TILDE_ENCODING_SAFE = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    b"abcdefghijklmnopqrstuvwxyz"
+    b"0123456789_-"
+    # This is the same as Python percent-encoding but I removed
+    # '.' and '~'
+)
+
+_space = ord(" ")
+
+
+class TildeEncoder(dict):
+    # Keeps a cache internally, via __missing__
+    def __missing__(self, b):
+        # Handle a cache miss, store encoded string in cache and return.
+        if b in _TILDE_ENCODING_SAFE:
+            res = chr(b)
+        elif b == _space:
+            res = "+"
+        else:
+            res = f"~{b:02X}"
+        self[b] = res
+        return res
+
+
+_tilde_encoder = TildeEncoder().__getitem__
+
+
+@documented
+def tilde_encode(s: str) -> str:
+    "Returns tilde-encoded string - for example ``/foo/bar`` -> ``~2Ffoo~2Fbar``"
+    return "".join(_tilde_encoder(char) for char in s.encode("utf-8"))
+
+
+@documented
+def tilde_decode(s: str) -> str:
+    "Decodes a tilde-encoded string, so ``~2Ffoo~2Fbar`` -> ``/foo/bar``"
+    # Avoid accidentally decoding a %2f style sequence
+    temp = secrets.token_hex(16)
+    s = s.replace("%", temp)
+    decoded = urllib.parse.unquote_plus(s.replace("~", "%"))
+    return decoded.replace(temp, "%")
+
+
+def resolve_routes(routes, path):
+    for regex, view in routes:
+        match = regex.match(path)
+        if match is not None:
+            return match, view
+    return None, None
+
+
+def truncate_url(url, length):
+    if (not length) or (len(url) <= length):
+        return url
+    bits = url.rsplit(".", 1)
+    if len(bits) == 2 and 1 <= len(bits[1]) <= 4 and "/" not in bits[1]:
+        rest, ext = bits
+        return rest[: length - 1 - len(ext)] + "…." + ext
+    return url[: length - 1] + "…"
+
+
+async def row_sql_params_pks(db, table, pk_values):
+    pks = await db.primary_keys(table)
+    use_rowid = not pks
+    select = "*"
+    if use_rowid:
+        select = "rowid, *"
+        pks = ["rowid"]
+    wheres = []
+    for i, pk in enumerate(pks):
+        escaped_pk = escape_sqlite(pk)
+        # Preserve the historic always-quoted SQL exposed by _extra=query
+        if escaped_pk == pk:
+            escaped_pk = f'"{pk}"'
+        wheres.append(f"{escaped_pk}=:p{i}")
+    sql = f"select {select} from {escape_sqlite(table)} where {' AND '.join(wheres)}"
+    params = {}
+    for i, pk_value in enumerate(pk_values):
+        params[f"p{i}"] = pk_value
+    return sql, params, pks
+
+
+def _handle_pair(key: str, value: str) -> dict:
+    """
+    Turn a key-value pair into a nested dictionary.
+    foo, bar => {'foo': 'bar'}
+    foo.bar, baz => {'foo': {'bar': 'baz'}}
+    foo.bar, [1, 2, 3] => {'foo': {'bar': [1, 2, 3]}}
+    foo.bar, "baz" => {'foo': {'bar': 'baz'}}
+    foo.bar, '{"baz": "qux"}' => {'foo': {'bar': "{'baz': 'qux'}"}}
+    """
+    try:
+        value = json.loads(value)
+    except json.JSONDecodeError:
+        # If it doesn't parse as JSON, treat it as a string
+        pass
+
+    keys = key.split(".")
+    result = current_dict = {}
+
+    for k in keys[:-1]:
+        current_dict[k] = {}
+        current_dict = current_dict[k]
+
+    current_dict[keys[-1]] = value
+    return result
+
+
+def _combine(base: dict, update: dict) -> dict:
+    """
+    Recursively merge two dictionaries.
+    """
+    for key, value in update.items():
+        if isinstance(value, dict) and key in base and isinstance(base[key], dict):
+            base[key] = _combine(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def pairs_to_nested_config(pairs: list[tuple[str, typing.Any]]) -> dict:
+    """
+    Parse a list of key-value pairs into a nested dictionary.
+    """
+    result = {}
+    for key, value in pairs:
+        parsed_pair = _handle_pair(key, value)
+        result = _combine(result, parsed_pair)
+    return result
+
+
+def make_slot_function(name, datasette, request, **kwargs):
+    from datasette.plugins import pm
+
+    method = getattr(pm.hook, name, None)
+    assert method is not None, f"No hook found for {name}"
+
+    async def inner():
+        html_bits = []
+        for hook in method(datasette=datasette, request=request, **kwargs):
+            html = await await_me_maybe(hook)
+            if html is not None:
+                html_bits.append(html)
+        return markupsafe.Markup("".join(html_bits))
+
+    return inner
+
+
+def prune_empty_dicts(d: dict):
+    """
+    Recursively prune all empty dictionaries from a given dictionary.
+    """
+    for key, value in list(d.items()):
+        if isinstance(value, dict):
+            prune_empty_dicts(value)
+            if value == {}:
+                d.pop(key, None)
+
+
+def move_plugins_and_allow(source: dict, destination: dict) -> tuple[dict, dict]:
+    """
+    Move 'plugins' and 'allow' keys from source to destination dictionary. Creates
+    hierarchy in destination if needed. After moving, recursively remove any keys
+    in the source that are left empty.
+    """
+    source = copy.deepcopy(source)
+    destination = copy.deepcopy(destination)
+
+    def recursive_move(src, dest, path=None):
+        if path is None:
+            path = []
+        for key, value in list(src.items()):
+            new_path = path + [key]
+            if key in ("plugins", "allow"):
+                # Navigate and create the hierarchy in destination if needed
+                d = dest
+                for step in path:
+                    d = d.setdefault(step, {})
+                # Move the plugins
+                d[key] = value
+                # Remove the plugins from source
+                src.pop(key, None)
+            elif isinstance(value, dict):
+                recursive_move(value, dest, new_path)
+                # After moving, check if the current dictionary is empty and remove it if so
+                if not value:
+                    src.pop(key, None)
+
+    recursive_move(source, destination)
+    prune_empty_dicts(source)
+    return source, destination
+
+
+_table_config_keys = (
+    "hidden",
+    "sort",
+    "sort_desc",
+    "size",
+    "sortable_columns",
+    "label_column",
+    "facets",
+    "fts_table",
+    "fts_pk",
+    "searchmode",
+)
+
+
+def move_table_config(metadata: dict, config: dict):
+    """
+    Move all known table configuration keys from metadata to config.
+    """
+    if "databases" not in metadata:
+        return metadata, config
+    metadata = copy.deepcopy(metadata)
+    config = copy.deepcopy(config)
+    for database_name, database in metadata["databases"].items():
+        if "tables" not in database:
+            continue
+        for table_name, table in database["tables"].items():
+            for key in _table_config_keys:
+                if key in table:
+                    config.setdefault("databases", {}).setdefault(
+                        database_name, {}
+                    ).setdefault("tables", {}).setdefault(table_name, {})[
+                        key
+                    ] = table.pop(
+                        key
+                    )
+    prune_empty_dicts(metadata)
+    return metadata, config
+
+
+def redact_keys(original: dict, key_patterns: Iterable) -> dict:
+    """
+    Recursively redact sensitive keys in a dictionary based on given patterns
+
+    :param original: The original dictionary
+    :param key_patterns: A list of substring patterns to redact
+    :return: A copy of the original dictionary with sensitive values redacted
+    """
+
+    def redact(data):
+        if isinstance(data, dict):
+            return {
+                k: (
+                    redact(v)
+                    if not any(pattern in k.casefold() for pattern in key_patterns)
+                    else "***"
+                )
+                for k, v in data.items()
+            }
+        elif isinstance(data, list):
+            return [redact(item) for item in data]
+        else:
+            return data
+
+    return redact(original)
+
+
+def md5_not_usedforsecurity(s):
+    try:
+        return hashlib.md5(s.encode("utf8"), usedforsecurity=False).hexdigest()
+    except TypeError:
+        # For Python 3.8 which does not support usedforsecurity=False
+        return hashlib.md5(s.encode("utf8")).hexdigest()
+
+
+_etag_cache = {}
+
+
+def sha256_file(filepath, chunk_size=4096):
+    hasher = hashlib.sha256()
+    with open(filepath, "rb") as fp:
+        while True:
+            chunk = fp.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+async def calculate_etag(filepath, chunk_size=4096):
+    if filepath in _etag_cache:
+        return _etag_cache[filepath]
+
+    hasher = hashlib.md5()
+    async with aiofiles.open(filepath, "rb") as f:
+        while True:
+            chunk = await f.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+
+    etag = f'"{hasher.hexdigest()}"'
+    _etag_cache[filepath] = etag
+
+    return etag
+
+
+def deep_dict_update(dict1, dict2):
+    for key, value in dict2.items():
+        if isinstance(value, dict):
+            dict1[key] = deep_dict_update(dict1.get(key, type(value)()), value)
+        else:
+            dict1[key] = value
+    return dict1

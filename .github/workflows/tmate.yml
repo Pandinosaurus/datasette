@@ -3,10 +3,16 @@ name: tmate session
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  models: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v7
     - name: Setup tmate session
       uses: mxschmitt/action-tmate@v3
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

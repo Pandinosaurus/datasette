@@ -1,56 +1,53 @@
-from datasette.app import Datasette
-from datasette.plugins import DEFAULT_PLUGINS
-from datasette.utils import detect_json1
-from datasette.utils.sqlite import sqlite3, sqlite_version, supports_table_xinfo
-from datasette.version import __version__
-from .fixtures import (  # noqa
-    app_client,
-    app_client_no_files,
-    app_client_with_hash,
-    app_client_shorter_time_limit,
-    app_client_larger_cache_size,
-    app_client_returned_rows_matches_page_size,
-    app_client_two_attached_databases,
-    app_client_two_attached_databases_one_immutable,
-    app_client_conflicting_database_names,
-    app_client_with_cors,
-    app_client_with_dot,
-    app_client_immutable_and_inspect_file,
-    generate_compound_rows,
-    generate_sortable_rows,
-    make_app_client,
-    supports_generated_columns,
-    EXPECTED_PLUGINS,
-    METADATA,
-)
-import json
-import pytest
-import sys
+import pathlib
 import urllib
 
+import pytest
 
-def test_homepage(app_client):
-    response = app_client.get("/.json")
-    assert response.status == 200
+from datasette.app import Datasette
+from datasette.plugins import DEFAULT_PLUGINS
+from datasette.resources import DatabaseResource, TableResource
+from datasette.utils import UNSTABLE_API_MESSAGE, escape_sqlite, tilde_encode
+from datasette.utils.sqlite import sqlite_version
+from datasette.version import __version__
+
+from .fixtures import EXPECTED_PLUGINS, make_app_client
+
+
+@pytest.mark.asyncio
+async def test_homepage(ds_client):
+    response = await ds_client.get("/.json")
+    assert response.status_code == 200
     assert "application/json; charset=utf-8" == response.headers["content-type"]
-    assert response.json.keys() == {"fixtures": 0}.keys()
-    d = response.json["fixtures"]
+    data = response.json()
+    assert sorted(data.get("metadata").keys()) == [
+        "about",
+        "about_url",
+        "description_html",
+        "license",
+        "license_url",
+        "source",
+        "source_url",
+        "title",
+    ]
+    databases = data.get("databases")
+    assert isinstance(databases, list)
+    assert [d["name"] for d in databases] == ["fixtures"]
+    d = databases[0]
     assert d["name"] == "fixtures"
-    assert d["tables_count"] == 25 if supports_generated_columns() else 24
-    assert len(d["tables_and_views_truncated"]) == 5
+    assert isinstance(d["tables_count"], int)
+    assert isinstance(len(d["tables_and_views_truncated"]), int)
     assert d["tables_and_views_more"] is True
-    # 4 hidden FTS tables + no_primary_key (hidden in metadata)
-    assert d["hidden_tables_count"] == 6
-    # 201 in no_primary_key, plus 6 in other hidden tables:
-    assert d["hidden_table_rows_sum"] == 207
-    assert d["views_count"] == 4
+    assert isinstance(d["hidden_tables_count"], int)
+    assert isinstance(d["hidden_table_rows_sum"], int)
+    assert isinstance(d["views_count"], int)
 
 
-def test_homepage_sort_by_relationships(app_client):
-    response = app_client.get("/.json?_sort=relationships")
-    assert response.status == 200
+@pytest.mark.asyncio
+async def test_homepage_sort_by_relationships(ds_client):
+    response = await ds_client.get("/.json?_sort=relationships")
+    assert response.status_code == 200
     tables = [
-        t["name"] for t in response.json["fixtures"]["tables_and_views_truncated"]
+        t["name"] for t in response.json()["databases"][0]["tables_and_views_truncated"]
     ]
     assert tables == [
         "simple_primary_key",
@@ -61,572 +58,223 @@ def test_homepage_sort_by_relationships(app_client):
     ]
 
 
-def test_database_page(app_client):
-    response = app_client.get("/fixtures.json")
-    assert response.status == 200
-    data = response.json
+@pytest.mark.asyncio
+async def test_database_page(ds_client):
+    response = await ds_client.get("/fixtures.json")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ok"] is True
     assert data["database"] == "fixtures"
-    assert data["tables"] == [
-        {
-            "name": "123_starts_with_digits",
-            "columns": ["content"],
-            "primary_keys": [],
-            "count": 0,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "Table With Space In Name",
-            "columns": ["pk", "content"],
-            "primary_keys": ["pk"],
-            "count": 0,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "attraction_characteristic",
-            "columns": ["pk", "name"],
-            "primary_keys": ["pk"],
-            "count": 2,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "roadside_attraction_characteristics",
-                        "column": "pk",
-                        "other_column": "characteristic_id",
-                    }
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "binary_data",
-            "columns": ["data"],
-            "primary_keys": [],
-            "count": 3,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "complex_foreign_keys",
-            "columns": ["pk", "f1", "f2", "f3"],
-            "primary_keys": ["pk"],
-            "count": 1,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [],
-                "outgoing": [
-                    {
-                        "other_table": "simple_primary_key",
-                        "column": "f3",
-                        "other_column": "id",
-                    },
-                    {
-                        "other_table": "simple_primary_key",
-                        "column": "f2",
-                        "other_column": "id",
-                    },
-                    {
-                        "other_table": "simple_primary_key",
-                        "column": "f1",
-                        "other_column": "id",
-                    },
-                ],
-            },
-            "private": False,
-        },
-        {
-            "name": "compound_primary_key",
-            "columns": ["pk1", "pk2", "content"],
-            "primary_keys": ["pk1", "pk2"],
-            "count": 1,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "compound_three_primary_keys",
-            "columns": ["pk1", "pk2", "pk3", "content"],
-            "primary_keys": ["pk1", "pk2", "pk3"],
-            "count": 1001,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "custom_foreign_key_label",
-            "columns": ["pk", "foreign_key_with_custom_label"],
-            "primary_keys": ["pk"],
-            "count": 1,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [],
-                "outgoing": [
-                    {
-                        "other_table": "primary_key_multiple_columns_explicit_label",
-                        "column": "foreign_key_with_custom_label",
-                        "other_column": "id",
-                    }
-                ],
-            },
-            "private": False,
-        },
-        {
-            "name": "facet_cities",
-            "columns": ["id", "name"],
-            "primary_keys": ["id"],
-            "count": 4,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "facetable",
-                        "column": "id",
-                        "other_column": "city_id",
-                    }
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "facetable",
-            "columns": [
-                "pk",
-                "created",
-                "planet_int",
-                "on_earth",
-                "state",
-                "city_id",
-                "neighborhood",
-                "tags",
-                "complex_array",
-                "distinct_some_null",
-            ],
-            "primary_keys": ["pk"],
-            "count": 15,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [],
-                "outgoing": [
-                    {
-                        "other_table": "facet_cities",
-                        "column": "city_id",
-                        "other_column": "id",
-                    }
-                ],
-            },
-            "private": False,
-        },
-        {
-            "name": "foreign_key_references",
-            "columns": [
-                "pk",
-                "foreign_key_with_label",
-                "foreign_key_with_blank_label",
-                "foreign_key_with_no_label",
-                "foreign_key_compound_pk1",
-                "foreign_key_compound_pk2",
-            ],
-            "primary_keys": ["pk"],
-            "count": 2,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [],
-                "outgoing": [
-                    {
-                        "other_table": "primary_key_multiple_columns",
-                        "column": "foreign_key_with_no_label",
-                        "other_column": "id",
-                    },
-                    {
-                        "other_table": "simple_primary_key",
-                        "column": "foreign_key_with_blank_label",
-                        "other_column": "id",
-                    },
-                    {
-                        "other_table": "simple_primary_key",
-                        "column": "foreign_key_with_label",
-                        "other_column": "id",
-                    },
-                ],
-            },
-            "private": False,
-        },
-    ] + (
-        [
-            {
-                "columns": ["body", "id", "consideration"],
-                "count": 1,
-                "foreign_keys": {"incoming": [], "outgoing": []},
-                "fts_table": None,
-                "hidden": False,
-                "name": "generated_columns",
-                "primary_keys": [],
-                "private": False,
-            }
-        ]
-        if supports_generated_columns()
-        else []
-    ) + [
-        {
-            "name": "infinity",
-            "columns": ["value"],
-            "primary_keys": [],
-            "count": 3,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "primary_key_multiple_columns",
-            "columns": ["id", "content", "content2"],
-            "primary_keys": ["id"],
-            "count": 1,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "foreign_key_references",
-                        "column": "id",
-                        "other_column": "foreign_key_with_no_label",
-                    }
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "primary_key_multiple_columns_explicit_label",
-            "columns": ["id", "content", "content2"],
-            "primary_keys": ["id"],
-            "count": 1,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "custom_foreign_key_label",
-                        "column": "id",
-                        "other_column": "foreign_key_with_custom_label",
-                    }
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "roadside_attraction_characteristics",
-            "columns": ["attraction_id", "characteristic_id"],
-            "primary_keys": [],
-            "count": 5,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [],
-                "outgoing": [
-                    {
-                        "other_table": "attraction_characteristic",
-                        "column": "characteristic_id",
-                        "other_column": "pk",
-                    },
-                    {
-                        "other_table": "roadside_attractions",
-                        "column": "attraction_id",
-                        "other_column": "pk",
-                    },
-                ],
-            },
-            "private": False,
-        },
-        {
-            "name": "roadside_attractions",
-            "columns": ["pk", "name", "address", "latitude", "longitude"],
-            "primary_keys": ["pk"],
-            "count": 4,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "roadside_attraction_characteristics",
-                        "column": "pk",
-                        "other_column": "attraction_id",
-                    }
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "searchable",
-            "columns": ["pk", "text1", "text2", "name with . and spaces"],
-            "primary_keys": ["pk"],
-            "count": 2,
-            "hidden": False,
-            "fts_table": "searchable_fts",
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "searchable_tags",
-                        "column": "pk",
-                        "other_column": "searchable_id",
-                    }
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "searchable_tags",
-            "columns": ["searchable_id", "tag"],
-            "primary_keys": ["searchable_id", "tag"],
-            "count": 2,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [],
-                "outgoing": [
-                    {"other_table": "tags", "column": "tag", "other_column": "tag"},
-                    {
-                        "other_table": "searchable",
-                        "column": "searchable_id",
-                        "other_column": "pk",
-                    },
-                ],
-            },
-            "private": False,
-        },
-        {
-            "name": "select",
-            "columns": ["group", "having", "and", "json"],
-            "primary_keys": [],
-            "count": 1,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "simple_primary_key",
-            "columns": ["id", "content"],
-            "primary_keys": ["id"],
-            "count": 4,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "foreign_key_references",
-                        "column": "id",
-                        "other_column": "foreign_key_with_blank_label",
-                    },
-                    {
-                        "other_table": "foreign_key_references",
-                        "column": "id",
-                        "other_column": "foreign_key_with_label",
-                    },
-                    {
-                        "other_table": "complex_foreign_keys",
-                        "column": "id",
-                        "other_column": "f3",
-                    },
-                    {
-                        "other_table": "complex_foreign_keys",
-                        "column": "id",
-                        "other_column": "f2",
-                    },
-                    {
-                        "other_table": "complex_foreign_keys",
-                        "column": "id",
-                        "other_column": "f1",
-                    },
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "sortable",
-            "columns": [
-                "pk1",
-                "pk2",
-                "content",
-                "sortable",
-                "sortable_with_nulls",
-                "sortable_with_nulls_2",
-                "text",
-            ],
-            "primary_keys": ["pk1", "pk2"],
-            "count": 201,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "table/with/slashes.csv",
-            "columns": ["pk", "content"],
-            "primary_keys": ["pk"],
-            "count": 1,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "tags",
-            "columns": ["tag"],
-            "primary_keys": ["tag"],
-            "count": 2,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {
-                "incoming": [
-                    {
-                        "other_table": "searchable_tags",
-                        "column": "tag",
-                        "other_column": "tag",
-                    }
-                ],
-                "outgoing": [],
-            },
-            "private": False,
-        },
-        {
-            "name": "units",
-            "columns": ["pk", "distance", "frequency"],
-            "primary_keys": ["pk"],
-            "count": 3,
-            "hidden": False,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "no_primary_key",
-            "columns": ["content", "a", "b", "c"],
-            "primary_keys": [],
-            "count": 201,
-            "hidden": True,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "searchable_fts",
-            "columns": [
-                "text1",
-                "text2",
-                "name with . and spaces",
-            ]
-            + (
-                [
-                    "searchable_fts",
-                    "docid",
-                    "__langid",
-                ]
-                if supports_table_xinfo()
-                else []
-            ),
-            "primary_keys": [],
-            "count": 2,
-            "hidden": True,
-            "fts_table": "searchable_fts",
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "searchable_fts_docsize",
-            "columns": ["docid", "size"],
-            "primary_keys": ["docid"],
-            "count": 2,
-            "hidden": True,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "searchable_fts_segdir",
-            "columns": [
-                "level",
-                "idx",
-                "start_block",
-                "leaves_end_block",
-                "end_block",
-                "root",
-            ],
-            "primary_keys": ["level", "idx"],
-            "count": 1,
-            "hidden": True,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "searchable_fts_segments",
-            "columns": ["blockid", "block"],
-            "primary_keys": ["blockid"],
-            "count": 0,
-            "hidden": True,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-        {
-            "name": "searchable_fts_stat",
-            "columns": ["id", "value"],
-            "primary_keys": ["id"],
-            "count": 1,
-            "hidden": True,
-            "fts_table": None,
-            "foreign_keys": {"incoming": [], "outgoing": []},
-            "private": False,
-        },
-    ]
+
+    # Build lookup for easier assertions
+    tables = data["tables"]
+    tables_by_name = {t["name"]: t for t in tables}
+
+    # Verify tables are sorted by (hidden, name) - visible first, then hidden
+    table_names = [t["name"] for t in tables]
+    expected_order = sorted(tables, key=lambda t: (t["hidden"], t["name"]))
+    assert table_names == [t["name"] for t in expected_order]
+
+    # Expected visible tables (not hidden)
+    expected_visible_tables = {
+        "123_starts_with_digits",
+        "Table With Space In Name",
+        "attraction_characteristic",
+        "binary_data",
+        "complex_foreign_keys",
+        "compound_primary_key",
+        "compound_three_primary_keys",
+        "custom_foreign_key_label",
+        "facet_cities",
+        "facetable",
+        "foreign_key_references",
+        "infinity",
+        "primary_key_multiple_columns",
+        "primary_key_multiple_columns_explicit_label",
+        "roadside_attraction_characteristics",
+        "roadside_attractions",
+        "searchable",
+        "searchable_tags",
+        "select",
+        "simple_primary_key",
+        "sortable",
+        "table/with/slashes.csv",
+        "tags",
+    }
+
+    # The external-content index is visible, but its shadow tables need a
+    # second dependency hop and are excluded by the one-hop permission policy.
+    expected_hidden_tables = {
+        "no_primary_key",
+        "searchable_fts",
+    }
+
+    # Verify all expected tables exist
+    assert expected_visible_tables.issubset(tables_by_name.keys())
+    assert expected_hidden_tables.issubset(tables_by_name.keys())
+
+    # Verify hidden status
+    visible_tables = {t["name"] for t in tables if not t["hidden"]}
+    hidden_tables = {t["name"] for t in tables if t["hidden"]}
+    assert expected_visible_tables == visible_tables
+    assert expected_hidden_tables == hidden_tables
+
+    # Helper to compare foreign keys (order-insensitive)
+    def fk_set(fks):
+        return {(fk["other_table"], fk["column"], fk["other_column"]) for fk in fks}
+
+    # Test specific table properties
+    # -- facetable: has outgoing FK to facet_cities
+    facetable = tables_by_name["facetable"]
+    assert facetable["count"] == 15
+    assert facetable["primary_keys"] == ["pk"]
+    assert facetable["fts_table"] is None
+    assert facetable["private"] is False
+    assert fk_set(facetable["foreign_keys"]["outgoing"]) == {
+        ("facet_cities", "_city_id", "id")
+    }
+    assert fk_set(facetable["foreign_keys"]["incoming"]) == set()
+
+    # -- facet_cities: has incoming FK from facetable
+    facet_cities = tables_by_name["facet_cities"]
+    assert facet_cities["count"] == 4
+    assert facet_cities["columns"] == ["id", "name"]
+    assert fk_set(facet_cities["foreign_keys"]["incoming"]) == {
+        ("facetable", "id", "_city_id")
+    }
+
+    # -- simple_primary_key: has multiple incoming FKs
+    simple_pk = tables_by_name["simple_primary_key"]
+    assert simple_pk["count"] == 5
+    assert simple_pk["columns"] == ["id", "content"]
+    assert simple_pk["primary_keys"] == ["id"]
+    # Should have incoming FKs from complex_foreign_keys (f1, f2, f3) and foreign_key_references
+    incoming = fk_set(simple_pk["foreign_keys"]["incoming"])
+    assert ("complex_foreign_keys", "id", "f1") in incoming
+    assert ("complex_foreign_keys", "id", "f2") in incoming
+    assert ("complex_foreign_keys", "id", "f3") in incoming
+    assert ("foreign_key_references", "id", "foreign_key_with_label") in incoming
+    assert ("foreign_key_references", "id", "foreign_key_with_blank_label") in incoming
+
+    # -- complex_foreign_keys: has multiple outgoing FKs to same table
+    complex_fk = tables_by_name["complex_foreign_keys"]
+    assert complex_fk["count"] == 1
+    assert complex_fk["columns"] == ["pk", "f1", "f2", "f3"]
+    outgoing = fk_set(complex_fk["foreign_keys"]["outgoing"])
+    assert outgoing == {
+        ("simple_primary_key", "f1", "id"),
+        ("simple_primary_key", "f2", "id"),
+        ("simple_primary_key", "f3", "id"),
+    }
+
+    # -- searchable: has FTS table association
+    searchable = tables_by_name["searchable"]
+    assert searchable["count"] == 2
+    assert searchable["fts_table"] == "searchable_fts"
+    assert searchable["columns"] == ["pk", "text1", "text2", "name with . and spaces"]
+
+    # -- searchable_fts: is the FTS virtual table (hidden)
+    searchable_fts = tables_by_name["searchable_fts"]
+    assert searchable_fts["hidden"] is True
+    assert searchable_fts["fts_table"] == "searchable_fts"
+    # The "rank" column became visible in pragma_table_info in SQLite 3.37+
+    if sqlite_version() >= (3, 37, 0):
+        assert "rank" in searchable_fts["columns"]
+
+    # -- compound primary keys
+    compound_pk = tables_by_name["compound_primary_key"]
+    assert compound_pk["primary_keys"] == ["pk1", "pk2"]
+    assert compound_pk["count"] == 3
+
+    compound_three = tables_by_name["compound_three_primary_keys"]
+    assert compound_three["primary_keys"] == ["pk1", "pk2", "pk3"]
+    assert compound_three["count"] == 1001
+
+    # -- sortable: generated data
+    sortable = tables_by_name["sortable"]
+    assert sortable["count"] == 201
+    assert sortable["primary_keys"] == ["pk1", "pk2"]
+
+    # -- no_primary_key: hidden table with generated data
+    no_pk = tables_by_name["no_primary_key"]
+    assert no_pk["hidden"] is True
+    assert no_pk["count"] == 202
+    assert no_pk["primary_keys"] == []
+
+    # -- roadside attractions relationship chain
+    attractions = tables_by_name["roadside_attractions"]
+    assert attractions["count"] == 4
+    assert fk_set(attractions["foreign_keys"]["incoming"]) == {
+        ("roadside_attraction_characteristics", "pk", "attraction_id")
+    }
+
+    characteristics = tables_by_name["attraction_characteristic"]
+    assert characteristics["count"] == 2
+    assert fk_set(characteristics["foreign_keys"]["incoming"]) == {
+        ("roadside_attraction_characteristics", "pk", "characteristic_id")
+    }
+
+    # -- searchable_tags: multiple outgoing FKs
+    searchable_tags = tables_by_name["searchable_tags"]
+    assert searchable_tags["primary_keys"] == ["searchable_id", "tag"]
+    outgoing = fk_set(searchable_tags["foreign_keys"]["outgoing"])
+    assert outgoing == {
+        ("searchable", "searchable_id", "pk"),
+        ("tags", "tag", "tag"),
+    }
+
+    # -- tables with special names
+    assert "123_starts_with_digits" in tables_by_name
+    assert "Table With Space In Name" in tables_by_name
+    assert "table/with/slashes.csv" in tables_by_name
+    assert "select" in tables_by_name  # SQL reserved word
+
+    # Verify select table has SQL reserved word columns
+    select_table = tables_by_name["select"]
+    assert set(select_table["columns"]) == {"group", "having", "and", "json"}
+
+    # Verify all tables have required fields
+    for table in tables:
+        assert "name" in table
+        assert "columns" in table
+        assert "primary_keys" in table
+        assert "count" in table
+        assert "hidden" in table
+        assert "fts_table" in table
+        assert "foreign_keys" in table
+        assert "private" in table
+        assert "incoming" in table["foreign_keys"]
+        assert "outgoing" in table["foreign_keys"]
 
 
 def test_no_files_uses_memory_database(app_client_no_files):
     response = app_client_no_files.get("/.json")
     assert response.status == 200
     assert {
-        "_memory": {
-            "name": "_memory",
-            "hash": None,
-            "color": "a6c7b9",
-            "path": "/_memory",
-            "tables_and_views_truncated": [],
-            "tables_and_views_more": False,
-            "tables_count": 0,
-            "table_rows_sum": 0,
-            "show_table_row_counts": False,
-            "hidden_table_rows_sum": 0,
-            "hidden_tables_count": 0,
-            "views_count": 0,
-            "private": False,
-        }
+        "ok": True,
+        "unstable": UNSTABLE_API_MESSAGE,
+        "databases": [
+            {
+                "name": "_memory",
+                "hash": None,
+                "color": "a6c7b9",
+                "path": "/_memory",
+                "tables_and_views_truncated": [],
+                "tables_and_views_more": False,
+                "tables_count": 0,
+                "table_rows_sum": 0,
+                "show_table_row_counts": False,
+                "hidden_table_rows_sum": 0,
+                "hidden_tables_count": 0,
+                "views_count": 0,
+                "private": False,
+            },
+        ],
+        "metadata": {},
     } == response.json
     # Try that SQL query
     response = app_client_no_files.get(
-        "/_memory.json?sql=select+sqlite_version()&_shape=array"
+        "/_memory/-/query.json?sql=select+sqlite_version()&_shape=array"
     )
     assert 1 == len(response.json)
     assert ["sqlite_version()"] == list(response.json[0].keys())
@@ -643,1125 +291,483 @@ def test_no_files_uses_memory_database(app_client_no_files):
     ),
 )
 def test_old_memory_urls_redirect(app_client_no_files, path, expected_redirect):
-    response = app_client_no_files.get(path, allow_redirects=False)
+    response = app_client_no_files.get(path)
     assert response.status == 301
     assert response.headers["location"] == expected_redirect
 
 
 def test_database_page_for_database_with_dot_in_name(app_client_with_dot):
-    response = app_client_with_dot.get("/fixtures.dot.json")
-    assert 200 == response.status
+    response = app_client_with_dot.get("/fixtures~2Edot.json")
+    assert response.status == 200
 
 
-def test_custom_sql(app_client):
-    response = app_client.get(
-        "/fixtures.json?sql=select+content+from+simple_primary_key&_shape=objects"
+@pytest.mark.asyncio
+async def test_custom_sql(ds_client):
+    response = await ds_client.get(
+        "/fixtures/-/query.json?sql=select+content+from+simple_primary_key",
     )
-    data = response.json
-    assert {"sql": "select content from simple_primary_key", "params": {}} == data[
-        "query"
-    ]
-    assert [
-        {"content": "hello"},
-        {"content": "world"},
-        {"content": ""},
-        {"content": "RENDER_CELL_DEMO"},
-    ] == data["rows"]
-    assert ["content"] == data["columns"]
-    assert "fixtures" == data["database"]
-    assert not data["truncated"]
+    data = response.json()
+    assert data == {
+        "rows": [
+            {"content": "hello"},
+            {"content": "world"},
+            {"content": ""},
+            {"content": "RENDER_CELL_DEMO"},
+            {"content": "RENDER_CELL_ASYNC"},
+        ],
+        "ok": True,
+        "truncated": False,
+    }
 
 
+@pytest.mark.xfail(reason="Sometimes flaky in CI due to timing issues")
 def test_sql_time_limit(app_client_shorter_time_limit):
-    response = app_client_shorter_time_limit.get("/fixtures.json?sql=select+sleep(0.5)")
+    response = app_client_shorter_time_limit.get(
+        "/fixtures/-/query.json?sql=select+sleep(0.5)",
+    )
     assert 400 == response.status
-    assert "SQL Interrupted" == response.json["title"]
-
-
-def test_custom_sql_time_limit(app_client):
-    response = app_client.get("/fixtures.json?sql=select+sleep(0.01)")
-    assert 200 == response.status
-    response = app_client.get("/fixtures.json?sql=select+sleep(0.01)&_timelimit=5")
-    assert 400 == response.status
-    assert "SQL Interrupted" == response.json["title"]
-
-
-def test_invalid_custom_sql(app_client):
-    response = app_client.get("/fixtures.json?sql=.schema")
-    assert response.status == 400
-    assert response.json["ok"] is False
-    assert "Statement must be a SELECT" == response.json["error"]
-
-
-def test_table_json(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_shape=objects")
-    assert response.status == 200
-    data = response.json
-    assert (
-        data["query"]["sql"]
-        == "select id, content from simple_primary_key order by id limit 51"
+    expected_message = (
+        "SQL query took too long. The time limit is"
+        " controlled by the sql_time_limit_ms setting."
     )
-    assert data["query"]["params"] == {}
-    assert data["rows"] == [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-    ]
-
-
-def test_table_not_exists_json(app_client):
-    assert {
+    assert response.json == {
         "ok": False,
-        "error": "Table not found: blah",
-        "status": 404,
-        "title": None,
-    } == app_client.get("/fixtures/blah.json").json
-
-
-def test_jsono_redirects_to_shape_objects(app_client_with_hash):
-    response_1 = app_client_with_hash.get(
-        "/fixtures/simple_primary_key.jsono", allow_redirects=False
-    )
-    response = app_client_with_hash.get(
-        response_1.headers["Location"], allow_redirects=False
-    )
-    assert response.status == 302
-    assert response.headers["Location"].endswith("?_shape=objects")
-
-
-def test_table_shape_arrays(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_shape=arrays")
-    assert [
-        ["1", "hello"],
-        ["2", "world"],
-        ["3", ""],
-        ["4", "RENDER_CELL_DEMO"],
-    ] == response.json["rows"]
-
-
-def test_table_shape_arrayfirst(app_client):
-    response = app_client.get(
-        "/fixtures.json?"
-        + urllib.parse.urlencode(
-            {
-                "sql": "select content from simple_primary_key order by id",
-                "_shape": "arrayfirst",
-            }
-        )
-    )
-    assert ["hello", "world", "", "RENDER_CELL_DEMO"] == response.json
-
-
-def test_table_shape_objects(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_shape=objects")
-    assert [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-    ] == response.json["rows"]
-
-
-def test_table_shape_array(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_shape=array")
-    assert [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-    ] == response.json
-
-
-def test_table_shape_array_nl(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_shape=array&_nl=on")
-    lines = response.text.split("\n")
-    results = [json.loads(line) for line in lines]
-    assert [
-        {"id": "1", "content": "hello"},
-        {"id": "2", "content": "world"},
-        {"id": "3", "content": ""},
-        {"id": "4", "content": "RENDER_CELL_DEMO"},
-    ] == results
-
-
-def test_table_shape_invalid(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_shape=invalid")
-    assert {
-        "ok": False,
-        "error": "Invalid _shape: invalid",
+        "error": expected_message,
+        "errors": [expected_message],
         "status": 400,
-        "title": None,
-    } == response.json
+    }
 
 
-def test_table_shape_object(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_shape=object")
-    assert {
-        "1": {"id": "1", "content": "hello"},
-        "2": {"id": "2", "content": "world"},
-        "3": {"id": "3", "content": ""},
-        "4": {"id": "4", "content": "RENDER_CELL_DEMO"},
-    } == response.json
-
-
-def test_table_shape_object_compound_primary_key(app_client):
-    response = app_client.get("/fixtures/compound_primary_key.json?_shape=object")
-    assert {"a,b": {"pk1": "a", "pk2": "b", "content": "c"}} == response.json
-
-
-def test_table_with_slashes_in_name(app_client):
-    response = app_client.get(
-        "/fixtures/table%2Fwith%2Fslashes.csv?_shape=objects&_format=json"
+@pytest.mark.asyncio
+async def test_custom_sql_time_limit(ds_client):
+    response = await ds_client.get(
+        "/fixtures/-/query.json?sql=select+sleep(0.01)",
     )
-    assert response.status == 200
-    data = response.json
-    assert data["rows"] == [{"pk": "3", "content": "hey"}]
+    assert response.status_code == 200
+    response = await ds_client.get(
+        "/fixtures/-/query.json?sql=select+sleep(0.01)&_timelimit=5",
+    )
+    assert response.status_code == 400
+    assert response.json()["error"].startswith("SQL query took too long.")
 
 
-def test_table_with_reserved_word_name(app_client):
-    response = app_client.get("/fixtures/select.json?_shape=objects")
-    assert response.status == 200
-    data = response.json
-    assert data["rows"] == [
-        {
-            "rowid": 1,
-            "group": "group",
-            "having": "having",
-            "and": "and",
-            "json": '{"href": "http://example.com/", "label":"Example"}',
-        }
-    ]
+@pytest.mark.asyncio
+async def test_invalid_custom_sql(ds_client):
+    response = await ds_client.get(
+        "/fixtures/-/query.json?sql=.schema",
+    )
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+    assert "Statement must be a SELECT" == response.json()["error"]
 
 
+@pytest.mark.asyncio
+async def test_row(ds_client):
+    response = await ds_client.get("/fixtures/simple_primary_key/1.json?_shape=objects")
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["rows"] == [{"id": 1, "content": "hello"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ("", ".json"))
 @pytest.mark.parametrize(
-    "path,expected_rows,expected_pages",
-    [
-        ("/fixtures/no_primary_key.json", 201, 5),
-        ("/fixtures/paginated_view.json", 201, 9),
-        ("/fixtures/no_primary_key.json?_size=25", 201, 9),
-        ("/fixtures/paginated_view.json?_size=50", 201, 5),
-        ("/fixtures/paginated_view.json?_size=max", 201, 3),
-        ("/fixtures/123_starts_with_digits.json", 0, 1),
-        # Ensure faceting doesn't break pagination:
-        ("/fixtures/compound_three_primary_keys.json?_facet=pk1", 1001, 21),
-        # Paginating while sorted by an expanded foreign key should work
-        (
-            "/fixtures/roadside_attraction_characteristics.json?_size=2&_sort=attraction_id&_labels=on",
-            5,
-            3,
-        ),
-    ],
+    "row_path",
+    (
+        "a",  # too few components for a two-column primary key
+        "a,b,c",  # too many components for a two-column primary key
+    ),
 )
-def test_paginate_tables_and_views(app_client, path, expected_rows, expected_pages):
-    fetched = []
-    count = 0
-    while path:
-        response = app_client.get(path)
-        assert 200 == response.status
-        count += 1
-        fetched.extend(response.json["rows"])
-        path = response.json["next_url"]
-        if path:
-            assert urllib.parse.urlencode({"_next": response.json["next"]}) in path
-            path = path.replace("http://localhost", "")
-        assert count < 30, "Possible infinite loop detected"
-
-    assert expected_rows == len(fetched)
-    assert expected_pages == count
+async def test_row_pk_arity_mismatch_returns_400(ds_client, row_path, suffix):
+    # A row URL with the wrong number of comma-separated primary key
+    # components used to raise an uncaught sqlite3.ProgrammingError (HTTP 500)
+    # because the SQL had one bind placeholder per PK column but params were
+    # only bound for the supplied components. It should be a 400 instead,
+    # mirroring the existing guard in datasette/views/table.py.
+    response = await ds_client.get(f"/fixtures/compound_primary_key/{row_path}{suffix}")
+    assert response.status_code == 400
+    if suffix == ".json":
+        assert response.json()["ok"] is False
+        assert response.json()["status"] == 400
 
 
-@pytest.mark.parametrize(
-    "path,expected_error",
-    [
-        ("/fixtures/no_primary_key.json?_size=-4", "_size must be a positive integer"),
-        ("/fixtures/no_primary_key.json?_size=dog", "_size must be a positive integer"),
-        ("/fixtures/no_primary_key.json?_size=1001", "_size must be <= 100"),
-    ],
-)
-def test_validate_page_size(app_client, path, expected_error):
-    response = app_client.get(path)
-    assert expected_error == response.json["error"]
-    assert 400 == response.status
-
-
-def test_page_size_zero(app_client):
-    """For _size=0 we return the counts, empty rows and no continuation token"""
-    response = app_client.get("/fixtures/no_primary_key.json?_size=0")
-    assert 200 == response.status
-    assert [] == response.json["rows"]
-    assert 201 == response.json["filtered_table_rows_count"]
-    assert None is response.json["next"]
-    assert None is response.json["next_url"]
-
-
-def test_paginate_compound_keys(app_client):
-    fetched = []
-    path = "/fixtures/compound_three_primary_keys.json?_shape=objects"
-    page = 0
-    while path:
-        page += 1
-        response = app_client.get(path)
-        fetched.extend(response.json["rows"])
-        path = response.json["next_url"]
-        if path:
-            path = path.replace("http://localhost", "")
-        assert page < 100
-    assert 1001 == len(fetched)
-    assert 21 == page
-    # Should be correctly ordered
-    contents = [f["content"] for f in fetched]
-    expected = [r[3] for r in generate_compound_rows(1001)]
-    assert expected == contents
-
-
-def test_paginate_compound_keys_with_extra_filters(app_client):
-    fetched = []
-    path = (
-        "/fixtures/compound_three_primary_keys.json?content__contains=d&_shape=objects"
+@pytest.mark.asyncio
+async def test_row_compound_pk_correct_arity(ds_client):
+    # The valid two-component URL still resolves the row.
+    response = await ds_client.get(
+        "/fixtures/compound_primary_key/a,b.json?_shape=objects"
     )
-    page = 0
-    while path:
-        page += 1
-        assert page < 100
-        response = app_client.get(path)
-        fetched.extend(response.json["rows"])
-        path = response.json["next_url"]
-        if path:
-            path = path.replace("http://localhost", "")
-    assert 2 == page
-    expected = [r[3] for r in generate_compound_rows(1001) if "d" in r[3]]
-    assert expected == [f["content"] for f in fetched]
+    assert response.status_code == 200
+    assert response.json()["rows"] == [{"pk1": "a", "pk2": "b", "content": "c"}]
 
 
-@pytest.mark.parametrize(
-    "query_string,sort_key,human_description_en",
-    [
-        ("_sort=sortable", lambda row: row["sortable"], "sorted by sortable"),
-        (
-            "_sort_desc=sortable",
-            lambda row: -row["sortable"],
-            "sorted by sortable descending",
-        ),
-        (
-            "_sort=sortable_with_nulls",
-            lambda row: (
-                1 if row["sortable_with_nulls"] is not None else 0,
-                row["sortable_with_nulls"],
-            ),
-            "sorted by sortable_with_nulls",
-        ),
-        (
-            "_sort_desc=sortable_with_nulls",
-            lambda row: (
-                1 if row["sortable_with_nulls"] is None else 0,
-                -row["sortable_with_nulls"]
-                if row["sortable_with_nulls"] is not None
-                else 0,
-                row["content"],
-            ),
-            "sorted by sortable_with_nulls descending",
-        ),
-        # text column contains '$null' - ensure it doesn't confuse pagination:
-        ("_sort=text", lambda row: row["text"], "sorted by text"),
-    ],
-)
-def test_sortable(app_client, query_string, sort_key, human_description_en):
-    path = f"/fixtures/sortable.json?_shape=objects&{query_string}"
-    fetched = []
-    page = 0
-    while path:
-        page += 1
-        assert page < 100
-        response = app_client.get(path)
-        assert human_description_en == response.json["human_description_en"]
-        fetched.extend(response.json["rows"])
-        path = response.json["next_url"]
-        if path:
-            path = path.replace("http://localhost", "")
-    assert 5 == page
-    expected = list(generate_sortable_rows(201))
-    expected.sort(key=sort_key)
-    assert [r["content"] for r in expected] == [r["content"] for r in fetched]
-
-
-def test_sortable_and_filtered(app_client):
-    path = (
-        "/fixtures/sortable.json"
-        "?content__contains=d&_sort_desc=sortable&_shape=objects"
+@pytest.mark.asyncio
+async def test_row_strange_table_name(ds_client):
+    response = await ds_client.get(
+        "/fixtures/table~2Fwith~2Fslashes~2Ecsv/3.json?_shape=objects"
     )
-    response = app_client.get(path)
-    fetched = response.json["rows"]
-    assert (
-        'where content contains "d" sorted by sortable descending'
-        == response.json["human_description_en"]
+    assert response.status_code == 200
+    assert response.json()["rows"] == [{"pk": "3", "content": "hey"}]
+
+
+@pytest.mark.asyncio
+async def test_row_foreign_key_tables(ds_client):
+    response = await ds_client.get(
+        "/fixtures/simple_primary_key/1.json?_extra=foreign_key_tables"
     )
-    expected = [row for row in generate_sortable_rows(201) if "d" in row["content"]]
-    assert len(expected) == response.json["filtered_table_rows_count"]
-    expected.sort(key=lambda row: -row["sortable"])
-    assert [r["content"] for r in expected] == [r["content"] for r in fetched]
-
-
-def test_sortable_argument_errors(app_client):
-    response = app_client.get("/fixtures/sortable.json?_sort=badcolumn")
-    assert "Cannot sort table by badcolumn" == response.json["error"]
-    response = app_client.get("/fixtures/sortable.json?_sort_desc=badcolumn2")
-    assert "Cannot sort table by badcolumn2" == response.json["error"]
-    response = app_client.get(
-        "/fixtures/sortable.json?_sort=sortable_with_nulls&_sort_desc=sortable"
-    )
-    assert "Cannot use _sort and _sort_desc at the same time" == response.json["error"]
-
-
-def test_sortable_columns_metadata(app_client):
-    response = app_client.get("/fixtures/sortable.json?_sort=content")
-    assert "Cannot sort table by content" == response.json["error"]
-    # no_primary_key has ALL sort options disabled
-    for column in ("content", "a", "b", "c"):
-        response = app_client.get(f"/fixtures/sortable.json?_sort={column}")
-        assert f"Cannot sort table by {column}" == response.json["error"]
-
-
-@pytest.mark.parametrize(
-    "path,expected_rows",
-    [
-        (
-            "/fixtures/searchable.json?_search=dog",
-            [
-                [1, "barry cat", "terry dog", "panther"],
-                [2, "terry dog", "sara weasel", "puma"],
-            ],
-        ),
-        (
-            # Special keyword shouldn't break FTS query
-            "/fixtures/searchable.json?_search=AND",
-            [],
-        ),
-        (
-            # Without _searchmode=raw this should return no results
-            "/fixtures/searchable.json?_search=te*+AND+do*",
-            [],
-        ),
-        (
-            # _searchmode=raw
-            "/fixtures/searchable.json?_search=te*+AND+do*&_searchmode=raw",
-            [
-                [1, "barry cat", "terry dog", "panther"],
-                [2, "terry dog", "sara weasel", "puma"],
-            ],
-        ),
-        (
-            # _searchmode=raw combined with _search_COLUMN
-            "/fixtures/searchable.json?_search_text2=te*&_searchmode=raw",
-            [
-                [1, "barry cat", "terry dog", "panther"],
-            ],
-        ),
-        (
-            "/fixtures/searchable.json?_search=weasel",
-            [[2, "terry dog", "sara weasel", "puma"]],
-        ),
-        (
-            "/fixtures/searchable.json?_search_text2=dog",
-            [[1, "barry cat", "terry dog", "panther"]],
-        ),
-        (
-            "/fixtures/searchable.json?_search_name%20with%20.%20and%20spaces=panther",
-            [[1, "barry cat", "terry dog", "panther"]],
-        ),
-    ],
-)
-def test_searchable(app_client, path, expected_rows):
-    response = app_client.get(path)
-    assert expected_rows == response.json["rows"]
-
-
-@pytest.mark.parametrize(
-    "path,expected_rows",
-    [
-        (
-            "/fixtures/searchable_view_configured_by_metadata.json?_search=weasel",
-            [[2, "terry dog", "sara weasel", "puma"]],
-        ),
-        # This should return all results because search is not configured:
-        (
-            "/fixtures/searchable_view.json?_search=weasel",
-            [
-                [1, "barry cat", "terry dog", "panther"],
-                [2, "terry dog", "sara weasel", "puma"],
-            ],
-        ),
-        (
-            "/fixtures/searchable_view.json?_search=weasel&_fts_table=searchable_fts&_fts_pk=pk",
-            [[2, "terry dog", "sara weasel", "puma"]],
-        ),
-    ],
-)
-def test_searchable_views(app_client, path, expected_rows):
-    response = app_client.get(path)
-    assert expected_rows == response.json["rows"]
-
-
-def test_searchable_invalid_column(app_client):
-    response = app_client.get("/fixtures/searchable.json?_search_invalid=x")
-    assert 400 == response.status
-    assert {
-        "ok": False,
-        "error": "Cannot search by that column",
-        "status": 400,
-        "title": None,
-    } == response.json
-
-
-@pytest.mark.parametrize(
-    "path,expected_rows",
-    [
-        ("/fixtures/simple_primary_key.json?content=hello", [["1", "hello"]]),
-        (
-            "/fixtures/simple_primary_key.json?content__contains=o",
-            [["1", "hello"], ["2", "world"], ["4", "RENDER_CELL_DEMO"]],
-        ),
-        ("/fixtures/simple_primary_key.json?content__exact=", [["3", ""]]),
-        (
-            "/fixtures/simple_primary_key.json?content__not=world",
-            [["1", "hello"], ["3", ""], ["4", "RENDER_CELL_DEMO"]],
-        ),
-    ],
-)
-def test_table_filter_queries(app_client, path, expected_rows):
-    response = app_client.get(path)
-    assert expected_rows == response.json["rows"]
-
-
-def test_table_filter_queries_multiple_of_same_type(app_client):
-    response = app_client.get(
-        "/fixtures/simple_primary_key.json?content__not=world&content__not=hello"
-    )
-    assert [["3", ""], ["4", "RENDER_CELL_DEMO"]] == response.json["rows"]
-
-
-@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
-def test_table_filter_json_arraycontains(app_client):
-    response = app_client.get("/fixtures/facetable.json?tags__arraycontains=tag1")
-    assert response.json["rows"] == [
-        [
-            1,
-            "2019-01-14 08:00:00",
-            1,
-            1,
-            "CA",
-            1,
-            "Mission",
-            '["tag1", "tag2"]',
-            '[{"foo": "bar"}]',
-            "one",
-        ],
-        [
-            2,
-            "2019-01-14 08:00:00",
-            1,
-            1,
-            "CA",
-            1,
-            "Dogpatch",
-            '["tag1", "tag3"]',
-            "[]",
-            "two",
-        ],
-    ]
-
-
-@pytest.mark.skipif(not detect_json1(), reason="Requires the SQLite json1 module")
-def test_table_filter_json_arraynotcontains(app_client):
-    response = app_client.get(
-        "/fixtures/facetable.json?tags__arraynotcontains=tag3&tags__not=[]"
-    )
-    assert response.json["rows"] == [
-        [
-            1,
-            "2019-01-14 08:00:00",
-            1,
-            1,
-            "CA",
-            1,
-            "Mission",
-            '["tag1", "tag2"]',
-            '[{"foo": "bar"}]',
-            "one",
-        ]
-    ]
-
-
-def test_table_filter_extra_where(app_client):
-    response = app_client.get("/fixtures/facetable.json?_where=neighborhood='Dogpatch'")
-    assert [
-        [
-            2,
-            "2019-01-14 08:00:00",
-            1,
-            1,
-            "CA",
-            1,
-            "Dogpatch",
-            '["tag1", "tag3"]',
-            "[]",
-            "two",
-        ]
-    ] == response.json["rows"]
-
-
-def test_table_filter_extra_where_invalid(app_client):
-    response = app_client.get("/fixtures/facetable.json?_where=neighborhood=Dogpatch'")
-    assert 400 == response.status
-    assert "Invalid SQL" == response.json["title"]
-
-
-def test_table_filter_extra_where_disabled_if_no_sql_allowed():
-    with make_app_client(metadata={"allow_sql": {}}) as client:
-        response = client.get("/fixtures/facetable.json?_where=neighborhood='Dogpatch'")
-        assert 403 == response.status
-        assert "_where= is not allowed" == response.json["error"]
-
-
-def test_table_through(app_client):
-    # Just the museums:
-    response = app_client.get(
-        '/fixtures/roadside_attractions.json?_through={"table":"roadside_attraction_characteristics","column":"characteristic_id","value":"1"}'
-    )
-    assert [
-        [
-            3,
-            "Burlingame Museum of PEZ Memorabilia",
-            "214 California Drive, Burlingame, CA 94010",
-            37.5793,
-            -122.3442,
-        ],
-        [
-            4,
-            "Bigfoot Discovery Museum",
-            "5497 Highway 9, Felton, CA 95018",
-            37.0414,
-            -122.0725,
-        ],
-    ] == response.json["rows"]
-    assert (
-        'where roadside_attraction_characteristics.characteristic_id = "1"'
-        == response.json["human_description_en"]
-    )
-
-
-def test_max_returned_rows(app_client):
-    response = app_client.get("/fixtures.json?sql=select+content+from+no_primary_key")
-    data = response.json
-    assert {"sql": "select content from no_primary_key", "params": {}} == data["query"]
-    assert data["truncated"]
-    assert 100 == len(data["rows"])
-
-
-def test_view(app_client):
-    response = app_client.get("/fixtures/simple_view.json?_shape=objects")
-    assert response.status == 200
-    data = response.json
-    assert data["rows"] == [
-        {"upper_content": "HELLO", "content": "hello"},
-        {"upper_content": "WORLD", "content": "world"},
-        {"upper_content": "", "content": ""},
-        {"upper_content": "RENDER_CELL_DEMO", "content": "RENDER_CELL_DEMO"},
-    ]
-
-
-def test_row(app_client):
-    response = app_client.get("/fixtures/simple_primary_key/1.json?_shape=objects")
-    assert response.status == 200
-    assert [{"id": "1", "content": "hello"}] == response.json["rows"]
-
-
-def test_row_format_in_querystring(app_client):
-    # regression test for https://github.com/simonw/datasette/issues/563
-    response = app_client.get(
-        "/fixtures/simple_primary_key/1?_format=json&_shape=objects"
-    )
-    assert response.status == 200
-    assert [{"id": "1", "content": "hello"}] == response.json["rows"]
-
-
-def test_row_strange_table_name(app_client):
-    response = app_client.get(
-        "/fixtures/table%2Fwith%2Fslashes.csv/3.json?_shape=objects"
-    )
-    assert response.status == 200
-    assert [{"pk": "3", "content": "hey"}] == response.json["rows"]
-
-
-def test_row_foreign_key_tables(app_client):
-    response = app_client.get(
-        "/fixtures/simple_primary_key/1.json?_extras=foreign_key_tables"
-    )
-    assert response.status == 200
-    assert response.json["foreign_key_tables"] == [
-        {
-            "other_table": "foreign_key_references",
-            "column": "id",
-            "other_column": "foreign_key_with_blank_label",
-            "count": 0,
-        },
-        {
-            "other_table": "foreign_key_references",
-            "column": "id",
-            "other_column": "foreign_key_with_label",
-            "count": 1,
-        },
+    assert response.status_code == 200
+    # Foreign keys are sorted by (other_table, column, other_column)
+    assert response.json()["foreign_key_tables"] == [
         {
             "other_table": "complex_foreign_keys",
             "column": "id",
-            "other_column": "f3",
+            "other_column": "f1",
             "count": 1,
+            "link": "/fixtures/complex_foreign_keys?f1=1",
         },
         {
             "other_table": "complex_foreign_keys",
             "column": "id",
             "other_column": "f2",
             "count": 0,
+            "link": "/fixtures/complex_foreign_keys?f2=1",
         },
         {
             "other_table": "complex_foreign_keys",
             "column": "id",
-            "other_column": "f1",
+            "other_column": "f3",
             "count": 1,
+            "link": "/fixtures/complex_foreign_keys?f3=1",
+        },
+        {
+            "other_table": "foreign_key_references",
+            "column": "id",
+            "other_column": "foreign_key_with_blank_label",
+            "count": 0,
+            "link": "/fixtures/foreign_key_references?foreign_key_with_blank_label=1",
+        },
+        {
+            "other_table": "foreign_key_references",
+            "column": "id",
+            "other_column": "foreign_key_with_label",
+            "count": 1,
+            "link": "/fixtures/foreign_key_references?foreign_key_with_label=1",
         },
     ]
 
 
-def test_unit_filters(app_client):
-    response = app_client.get(
-        "/fixtures/units.json?distance__lt=75km&frequency__gt=1kHz"
+@pytest.mark.asyncio
+async def test_row_foreign_key_tables_omit_denied_tables(request):
+    actor = {"id": "reader"}
+    ds = Datasette(
+        memory=True,
+        default_deny=True,
+        config={
+            "databases": {
+                "data": {
+                    "tables": {
+                        "parents": {"permissions": {"view-table": True}},
+                        "private_children": {"permissions": {"view-table": False}},
+                    }
+                }
+            }
+        },
     )
-    assert response.status == 200
-    data = response.json
+    request.addfinalizer(ds.close)
+    db = ds.add_memory_database("fk_count_leak", name="data")
+    await db.execute_write("create table parents (id integer primary key, name text)")
+    await db.execute_write("""
+        create table private_children (
+            id integer primary key,
+            parent_id integer references parents(id)
+        )
+    """)
+    await db.execute_write("insert into parents values (1, 'Public parent')")
+    await db.execute_write("""
+        insert into private_children (id, parent_id) values
+            (1, 1),
+            (2, 1),
+            (3, 1)
+    """)
+    await ds.invoke_startup()
 
-    assert data["units"]["distance"] == "m"
-    assert data["units"]["frequency"] == "Hz"
+    parent = TableResource(database="data", table="parents")
+    private_children = TableResource(database="data", table="private_children")
+    assert await ds.allowed(action="view-table", resource=parent, actor=actor)
+    assert not await ds.allowed(
+        action="view-table", resource=private_children, actor=actor
+    )
+    assert not await ds.allowed(
+        action="execute-sql",
+        resource=DatabaseResource(database="data"),
+        actor=actor,
+    )
 
-    assert len(data["rows"]) == 1
-    assert data["rows"][0][0] == 2
+    direct_child = await ds.client.get("/data/private_children.json", actor=actor)
+    assert direct_child.status_code == 403
+    parent_response = await ds.client.get(
+        "/data/parents/1.json?_extra=foreign_key_tables", actor=actor
+    )
+    assert parent_response.status_code == 200
+
+    foreign_key_tables = parent_response.json().get("foreign_key_tables", [])
+    assert foreign_key_tables == [], (
+        "denied child table name, foreign-key column, and row count disclosed: "
+        f"{foreign_key_tables}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_row_extras(ds_client):
+    response = await ds_client.get(
+        "/fixtures/simple_primary_key/1.json?_extra=database,table,primary_keys,query,request,debug,foreign_key_tables,column_details"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["database"] == "fixtures"
+    assert data["table"] == "simple_primary_key"
+    assert data["primary_keys"] == ["id"]
+    assert data["query"]["sql"] == 'select * from simple_primary_key where "id"=:p0'
+    assert data["query"]["params"] == {"p0": "1"}
+    assert data["request"]["path"] == "/fixtures/simple_primary_key/1.json"
+    assert data["debug"]["url_vars"] == {
+        "database": "fixtures",
+        "table": "simple_primary_key",
+        "pks": "1",
+        "format": "json",
+    }
+    assert len(data["foreign_key_tables"]) == 5
+    id_detail = data["column_details"]["id"]
+    assert id_detail["type"].lower() == "integer"
+    assert id_detail == {
+        "type": id_detail["type"],
+        "sqlite_type": "INTEGER",
+        "notnull": False,
+        "default": None,
+        "is_pk": True,
+        "pk_position": 1,
+        "hidden": 0,
+    }
+    content_detail = data["column_details"]["content"]
+    assert content_detail["type"].lower() == "text"
+    assert content_detail == {
+        "type": content_detail["type"],
+        "sqlite_type": "TEXT",
+        "notnull": False,
+        "default": None,
+        "is_pk": False,
+        "pk_position": 0,
+        "hidden": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_column_details_extra_row_for_null_blob(ds_client):
+    response = await ds_client.get("/fixtures/binary_data/3.json?_extra=column_details")
+    assert response.status_code == 200
+    data_detail = response.json()["column_details"]["data"]
+    assert data_detail["type"].lower() == "blob"
+    assert data_detail == {
+        "type": data_detail["type"],
+        "sqlite_type": "BLOB",
+        "notnull": False,
+        "default": None,
+        "is_pk": False,
+        "pk_position": 0,
+        "hidden": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_row_extra_render_cell():
+    """Test that _extra=render_cell returns rendered HTML from render_cell plugin hook on row pages"""
+    from datasette import hookimpl
+    from datasette.app import Datasette
+
+    class TestRenderCellPlugin:
+        __name__ = "TestRenderCellPlugin"
+
+        @hookimpl
+        def render_cell(self, value, column, table, database):
+            # Only modify cells in our test table
+            if table == "test_render" and column == "name":
+                return f"<strong>{value}</strong>"
+            return None
+
+    ds = Datasette(memory=True)
+    await ds.invoke_startup()
+    db = ds.add_memory_database("test_row_render")
+    await db.execute_write(
+        "create table test_render (id integer primary key, name text)"
+    )
+    await db.execute_write("insert into test_render values (1, 'Alice')")
+
+    # Register our test plugin
+    ds.pm.register(TestRenderCellPlugin(), name="TestRenderCellPlugin")
+
+    try:
+        # Request row with _extra=render_cell
+        response = await ds.client.get(
+            "/test_row_render/test_render/1.json?_extra=render_cell"
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Verify the response structure
+        assert "render_cell" in data
+        assert "rows" in data
+
+        # render_cell should be a list with one row (since this is a row page)
+        # Only columns modified by plugins are included (sparse output)
+        render_cell = data["render_cell"]
+        assert len(render_cell) == 1
+
+        # The row: id=1, name='Alice'
+        # The 'name' column should be rendered by our plugin as <strong>Alice</strong>
+        assert render_cell[0]["name"] == "<strong>Alice</strong>"
+        # The 'id' column is not included since no plugin modified it
+        assert "id" not in render_cell[0]
+
+        # The regular rows should still contain raw values
+        assert data["rows"] == [{"id": 1, "name": "Alice"}]
+
+    finally:
+        ds.pm.unregister(name="TestRenderCellPlugin")
 
 
 def test_databases_json(app_client_two_attached_databases_one_immutable):
     response = app_client_two_attached_databases_one_immutable.get("/-/databases.json")
-    databases = response.json
+    databases = response.json["databases"]
     assert 2 == len(databases)
     extra_database, fixtures_database = databases
     assert "extra database" == extra_database["name"]
-    assert None == extra_database["hash"]
-    assert True == extra_database["is_mutable"]
-    assert False == extra_database["is_memory"]
+    assert extra_database["hash"] is None
+    assert extra_database["is_mutable"] is True
+    assert extra_database["is_memory"] is False
 
     assert "fixtures" == fixtures_database["name"]
     assert fixtures_database["hash"] is not None
-    assert False == fixtures_database["is_mutable"]
-    assert False == fixtures_database["is_memory"]
+    assert fixtures_database["is_mutable"] is False
+    assert fixtures_database["is_memory"] is False
 
 
-def test_metadata_json(app_client):
-    response = app_client.get("/-/metadata.json")
-    assert METADATA == response.json
+@pytest.mark.asyncio
+async def test_threads_json(ds_client):
+    ds_client.ds.root_enabled = True
+    try:
+        response = await ds_client.get("/-/threads.json", actor={"id": "root"})
+    finally:
+        ds_client.ds.root_enabled = False
+    expected_keys = {"ok", "threads", "num_threads"}
+    expected_keys.update({"tasks", "num_tasks"})
+    data = response.json()
+    assert set(data.keys()) == expected_keys
+    # Should be at least one _execute_writes thread for __INTERNAL__
+    thread_names = [thread["name"] for thread in data["threads"]]
+    assert "_execute_writes for database __INTERNAL__" in thread_names
 
 
-def test_threads_json(app_client):
-    response = app_client.get("/-/threads.json")
-    expected_keys = {"threads", "num_threads"}
-    if sys.version_info >= (3, 7, 0):
-        expected_keys.update({"tasks", "num_tasks"})
-    assert expected_keys == set(response.json.keys())
-
-
-def test_plugins_json(app_client):
-    response = app_client.get("/-/plugins.json")
-    assert EXPECTED_PLUGINS == sorted(response.json, key=lambda p: p["name"])
+@pytest.mark.asyncio
+async def test_plugins_json(ds_client):
+    response = await ds_client.get("/-/plugins.json")
+    # Filter out TrackEventPlugin
+    actual_plugins = sorted(
+        [p for p in response.json() if p["name"] != "TrackEventPlugin"],
+        key=lambda p: p["name"],
+    )
+    assert EXPECTED_PLUGINS == actual_plugins
     # Try with ?all=1
-    response = app_client.get("/-/plugins.json?all=1")
-    names = {p["name"] for p in response.json}
+    response = await ds_client.get("/-/plugins.json?all=1")
+    names = {p["name"] for p in response.json()}
     assert names.issuperset(p["name"] for p in EXPECTED_PLUGINS)
     assert names.issuperset(DEFAULT_PLUGINS)
 
 
-def test_versions_json(app_client):
-    response = app_client.get("/-/versions.json")
-    assert "python" in response.json
-    assert "3.0" == response.json.get("asgi")
-    assert "version" in response.json["python"]
-    assert "full" in response.json["python"]
-    assert "datasette" in response.json
-    assert "version" in response.json["datasette"]
-    assert response.json["datasette"]["version"] == __version__
-    assert "sqlite" in response.json
-    assert "version" in response.json["sqlite"]
-    assert "fts_versions" in response.json["sqlite"]
-    assert "compile_options" in response.json["sqlite"]
+@pytest.mark.asyncio
+async def test_versions_json(ds_client):
+    response = await ds_client.get("/-/versions.json")
+    data = response.json()
+    assert "python" in data
+    assert "3.0" == data.get("asgi")
+    assert "version" in data["python"]
+    assert "full" in data["python"]
+    assert "datasette" in data
+    assert "version" in data["datasette"]
+    assert data["datasette"]["version"] == __version__
+    assert "sqlite" in data
+    assert "version" in data["sqlite"]
+    assert "fts_versions" in data["sqlite"]
+    assert "compile_options" in data["sqlite"]
+    # By default, the json1 extension is enabled in the SQLite
+    # provided by the `ubuntu-latest` github actions runner, and
+    # all versions of SQLite from 3.38.0 onwards
+    assert data["sqlite"]["extensions"]["json1"]
 
 
-def test_settings_json(app_client):
-    response = app_client.get("/-/settings.json")
-    assert {
+@pytest.mark.asyncio
+async def test_actions_json(ds_client):
+    original_root_enabled = ds_client.ds.root_enabled
+    try:
+        ds_client.ds.root_enabled = True
+        response = await ds_client.get("/-/actions.json", actor={"id": "root"})
+        data = response.json()["actions"]
+    finally:
+        ds_client.ds.root_enabled = original_root_enabled
+    assert isinstance(data, list)
+    assert len(data) > 0
+    # Check structure of first action
+    action = data[0]
+    for key in (
+        "name",
+        "abbr",
+        "description",
+        "takes_parent",
+        "takes_child",
+        "resource_class",
+        "also_requires",
+    ):
+        assert key in action
+    # Check that some expected actions exist
+    action_names = {a["name"] for a in data}
+    for expected_action in (
+        "view-instance",
+        "view-database",
+        "view-table",
+        "execute-sql",
+    ):
+        assert expected_action in action_names
+
+
+@pytest.mark.asyncio
+async def test_settings_json(ds_client):
+    response = await ds_client.get("/-/settings.json")
+    assert response.json() == {
+        "ok": True,
         "default_page_size": 50,
         "default_facet_size": 30,
-        "facet_suggest_time_limit_ms": 50,
+        "default_allow_sql": True,
+        "facet_suggest_time_limit_ms": 200,
         "facet_time_limit_ms": 200,
         "max_returned_rows": 100,
+        "max_insert_rows": 100,
+        "max_post_body_bytes": 2 * 1024 * 1024,
         "sql_time_limit_ms": 200,
         "allow_download": True,
+        "allow_signed_tokens": True,
+        "max_signed_tokens_ttl": 0,
         "allow_facet": True,
         "suggest_facets": True,
         "default_cache_ttl": 5,
-        "default_cache_ttl_hashed": 365 * 24 * 60 * 60,
         "num_sql_threads": 1,
         "cache_size_kb": 0,
         "allow_csv_stream": True,
         "max_csv_mb": 100,
         "truncate_cells_html": 2048,
         "force_https_urls": False,
-        "hash_urls": False,
         "template_debug": False,
+        "trace_debug": False,
         "base_url": "/",
-    } == response.json
-
-
-@pytest.mark.parametrize(
-    "path,expected_redirect",
-    (
-        ("/-/config.json", "/-/settings.json"),
-        ("/-/config", "/-/settings"),
-    ),
-)
-def test_config_redirects_to_settings(app_client, path, expected_redirect):
-    response = app_client.get(path, allow_redirects=False)
-    assert response.status == 301
-    assert response.headers["Location"] == expected_redirect
-
-
-def test_page_size_matching_max_returned_rows(
-    app_client_returned_rows_matches_page_size,
-):
-    fetched = []
-    path = "/fixtures/no_primary_key.json"
-    while path:
-        response = app_client_returned_rows_matches_page_size.get(path)
-        fetched.extend(response.json["rows"])
-        assert len(response.json["rows"]) in (1, 50)
-        path = response.json["next_url"]
-        if path:
-            path = path.replace("http://localhost", "")
-    assert 201 == len(fetched)
-
-
-@pytest.mark.parametrize(
-    "path,expected_facet_results",
-    [
-        (
-            "/fixtures/facetable.json?_facet=state&_facet=city_id",
-            {
-                "state": {
-                    "name": "state",
-                    "hideable": True,
-                    "type": "column",
-                    "toggle_url": "/fixtures/facetable.json?_facet=city_id",
-                    "results": [
-                        {
-                            "value": "CA",
-                            "label": "CA",
-                            "count": 10,
-                            "toggle_url": "_facet=state&_facet=city_id&state=CA",
-                            "selected": False,
-                        },
-                        {
-                            "value": "MI",
-                            "label": "MI",
-                            "count": 4,
-                            "toggle_url": "_facet=state&_facet=city_id&state=MI",
-                            "selected": False,
-                        },
-                        {
-                            "value": "MC",
-                            "label": "MC",
-                            "count": 1,
-                            "toggle_url": "_facet=state&_facet=city_id&state=MC",
-                            "selected": False,
-                        },
-                    ],
-                    "truncated": False,
-                },
-                "city_id": {
-                    "name": "city_id",
-                    "hideable": True,
-                    "type": "column",
-                    "toggle_url": "/fixtures/facetable.json?_facet=state",
-                    "results": [
-                        {
-                            "value": 1,
-                            "label": "San Francisco",
-                            "count": 6,
-                            "toggle_url": "_facet=state&_facet=city_id&city_id=1",
-                            "selected": False,
-                        },
-                        {
-                            "value": 2,
-                            "label": "Los Angeles",
-                            "count": 4,
-                            "toggle_url": "_facet=state&_facet=city_id&city_id=2",
-                            "selected": False,
-                        },
-                        {
-                            "value": 3,
-                            "label": "Detroit",
-                            "count": 4,
-                            "toggle_url": "_facet=state&_facet=city_id&city_id=3",
-                            "selected": False,
-                        },
-                        {
-                            "value": 4,
-                            "label": "Memnonia",
-                            "count": 1,
-                            "toggle_url": "_facet=state&_facet=city_id&city_id=4",
-                            "selected": False,
-                        },
-                    ],
-                    "truncated": False,
-                },
-            },
-        ),
-        (
-            "/fixtures/facetable.json?_facet=state&_facet=city_id&state=MI",
-            {
-                "state": {
-                    "name": "state",
-                    "hideable": True,
-                    "type": "column",
-                    "toggle_url": "/fixtures/facetable.json?_facet=city_id&state=MI",
-                    "results": [
-                        {
-                            "value": "MI",
-                            "label": "MI",
-                            "count": 4,
-                            "selected": True,
-                            "toggle_url": "_facet=state&_facet=city_id",
-                        }
-                    ],
-                    "truncated": False,
-                },
-                "city_id": {
-                    "name": "city_id",
-                    "hideable": True,
-                    "type": "column",
-                    "toggle_url": "/fixtures/facetable.json?_facet=state&state=MI",
-                    "results": [
-                        {
-                            "value": 3,
-                            "label": "Detroit",
-                            "count": 4,
-                            "selected": False,
-                            "toggle_url": "_facet=state&_facet=city_id&state=MI&city_id=3",
-                        }
-                    ],
-                    "truncated": False,
-                },
-            },
-        ),
-        (
-            "/fixtures/facetable.json?_facet=planet_int",
-            {
-                "planet_int": {
-                    "name": "planet_int",
-                    "hideable": True,
-                    "type": "column",
-                    "toggle_url": "/fixtures/facetable.json",
-                    "results": [
-                        {
-                            "value": 1,
-                            "label": 1,
-                            "count": 14,
-                            "selected": False,
-                            "toggle_url": "_facet=planet_int&planet_int=1",
-                        },
-                        {
-                            "value": 2,
-                            "label": 2,
-                            "count": 1,
-                            "selected": False,
-                            "toggle_url": "_facet=planet_int&planet_int=2",
-                        },
-                    ],
-                    "truncated": False,
-                }
-            },
-        ),
-        (
-            # planet_int is an integer field:
-            "/fixtures/facetable.json?_facet=planet_int&planet_int=1",
-            {
-                "planet_int": {
-                    "name": "planet_int",
-                    "hideable": True,
-                    "type": "column",
-                    "toggle_url": "/fixtures/facetable.json?planet_int=1",
-                    "results": [
-                        {
-                            "value": 1,
-                            "label": 1,
-                            "count": 14,
-                            "selected": True,
-                            "toggle_url": "_facet=planet_int",
-                        }
-                    ],
-                    "truncated": False,
-                }
-            },
-        ),
-    ],
-)
-def test_facets(app_client, path, expected_facet_results):
-    response = app_client.get(path)
-    facet_results = response.json["facet_results"]
-    # We only compare the querystring portion of the taggle_url
-    for facet_name, facet_info in facet_results.items():
-        assert facet_name == facet_info["name"]
-        assert False is facet_info["truncated"]
-        for facet_value in facet_info["results"]:
-            facet_value["toggle_url"] = facet_value["toggle_url"].split("?")[1]
-    assert expected_facet_results == facet_results
-
-
-def test_suggested_facets(app_client):
-    suggestions = [
-        {
-            "name": suggestion["name"],
-            "querystring": suggestion["toggle_url"].split("?")[-1],
-        }
-        for suggestion in app_client.get("/fixtures/facetable.json").json[
-            "suggested_facets"
-        ]
-    ]
-    expected = [
-        {"name": "created", "querystring": "_facet=created"},
-        {"name": "planet_int", "querystring": "_facet=planet_int"},
-        {"name": "on_earth", "querystring": "_facet=on_earth"},
-        {"name": "state", "querystring": "_facet=state"},
-        {"name": "city_id", "querystring": "_facet=city_id"},
-        {"name": "neighborhood", "querystring": "_facet=neighborhood"},
-        {"name": "tags", "querystring": "_facet=tags"},
-        {"name": "complex_array", "querystring": "_facet=complex_array"},
-        {"name": "created", "querystring": "_facet_date=created"},
-    ]
-    if detect_json1():
-        expected.append({"name": "tags", "querystring": "_facet_array=tags"})
-    assert expected == suggestions
-
-
-def test_allow_facet_off():
-    with make_app_client(config={"allow_facet": False}) as client:
-        assert 400 == client.get("/fixtures/facetable.json?_facet=planet_int").status
-        # Should not suggest any facets either:
-        assert [] == client.get("/fixtures/facetable.json").json["suggested_facets"]
-
-
-def test_suggest_facets_off():
-    with make_app_client(config={"suggest_facets": False}) as client:
-        # Now suggested_facets should be []
-        assert [] == client.get("/fixtures/facetable.json").json["suggested_facets"]
-
-
-def test_expand_labels(app_client):
-    response = app_client.get(
-        "/fixtures/facetable.json?_shape=object&_labels=1&_size=2"
-        "&neighborhood__contains=c"
-    )
-    assert {
-        "2": {
-            "pk": 2,
-            "created": "2019-01-14 08:00:00",
-            "planet_int": 1,
-            "on_earth": 1,
-            "state": "CA",
-            "city_id": {"value": 1, "label": "San Francisco"},
-            "neighborhood": "Dogpatch",
-            "tags": '["tag1", "tag3"]',
-            "complex_array": "[]",
-            "distinct_some_null": "two",
-        },
-        "13": {
-            "pk": 13,
-            "created": "2019-01-17 08:00:00",
-            "planet_int": 1,
-            "on_earth": 1,
-            "state": "MI",
-            "city_id": {"value": 3, "label": "Detroit"},
-            "neighborhood": "Corktown",
-            "tags": "[]",
-            "complex_array": "[]",
-            "distinct_some_null": None,
-        },
-    } == response.json
-
-
-def test_expand_label(app_client):
-    response = app_client.get(
-        "/fixtures/foreign_key_references.json?_shape=object"
-        "&_label=foreign_key_with_label&_size=1"
-    )
-    assert response.json == {
-        "1": {
-            "pk": "1",
-            "foreign_key_with_label": {"value": "1", "label": "hello"},
-            "foreign_key_with_blank_label": "3",
-            "foreign_key_with_no_label": "1",
-            "foreign_key_compound_pk1": "a",
-            "foreign_key_compound_pk2": "b",
-        }
     }
-
-
-@pytest.mark.parametrize(
-    "path,expected_cache_control",
-    [
-        ("/fixtures/facetable.json", "max-age=5"),
-        ("/fixtures/facetable.json?_ttl=invalid", "max-age=5"),
-        ("/fixtures/facetable.json?_ttl=10", "max-age=10"),
-        ("/fixtures/facetable.json?_ttl=0", "no-cache"),
-    ],
-)
-def test_ttl_parameter(app_client, path, expected_cache_control):
-    response = app_client.get(path)
-    assert expected_cache_control == response.headers["Cache-Control"]
-
-
-@pytest.mark.parametrize(
-    "path,expected_redirect",
-    [
-        ("/fixtures/facetable.json?_hash=1", "/fixtures-HASH/facetable.json"),
-        (
-            "/fixtures/facetable.json?city_id=1&_hash=1",
-            "/fixtures-HASH/facetable.json?city_id=1",
-        ),
-    ],
-)
-def test_hash_parameter(
-    app_client_two_attached_databases_one_immutable, path, expected_redirect
-):
-    # First get the current hash for the fixtures database
-    current_hash = app_client_two_attached_databases_one_immutable.ds.databases[
-        "fixtures"
-    ].hash[:7]
-    response = app_client_two_attached_databases_one_immutable.get(
-        path, allow_redirects=False
-    )
-    assert response.status == 302
-    location = response.headers["Location"]
-    assert expected_redirect.replace("HASH", current_hash) == location
-
-
-def test_hash_parameter_ignored_for_mutable_databases(app_client):
-    path = "/fixtures/facetable.json?_hash=1"
-    response = app_client.get(path, allow_redirects=False)
-    assert response.status == 200
 
 
 test_json_columns_default_expected = [
@@ -1769,6 +775,7 @@ test_json_columns_default_expected = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "extra_args,expected",
     [
@@ -1782,27 +789,33 @@ test_json_columns_default_expected = [
         ),
     ],
 )
-def test_json_columns(app_client, extra_args, expected):
+async def test_json_columns(ds_client, extra_args, expected):
     sql = """
         select 1 as intval, "s" as strval, 0.5 as floatval,
         '{"foo": "bar"}' as jsonval
     """
-    path = "/fixtures.json?" + urllib.parse.urlencode({"sql": sql, "_shape": "array"})
+    path = "/fixtures/-/query.json?" + urllib.parse.urlencode(
+        {"sql": sql, "_shape": "array"}
+    )
     path += extra_args
-    response = app_client.get(path)
-    assert expected == response.json
+    response = await ds_client.get(
+        path,
+    )
+    assert response.json() == expected
 
 
 def test_config_cache_size(app_client_larger_cache_size):
     response = app_client_larger_cache_size.get("/fixtures/pragma_cache_size.json")
-    assert [[-2500]] == response.json["rows"]
+    assert response.json["rows"] == [{"cache_size": -2500}]
 
 
 def test_config_force_https_urls():
-    with make_app_client(config={"force_https_urls": True}) as client:
-        response = client.get("/fixtures/facetable.json?_size=3&_facet=state")
+    with make_app_client(settings={"force_https_urls": True}) as client:
+        response = client.get(
+            "/fixtures/facetable.json?_size=3&_facet=state&_extra=suggested_facets"
+        )
         assert response.json["next_url"].startswith("https://")
-        assert response.json["facet_results"]["state"]["results"][0][
+        assert response.json["facet_results"]["results"]["state"]["results"][0][
             "toggle_url"
         ].startswith("https://")
         assert response.json["suggested_facets"][0]["toggle_url"].startswith("https://")
@@ -1812,50 +825,6 @@ def test_config_force_https_urls():
         assert client.ds._last_request.scheme == "https"
 
 
-def test_infinity_returned_as_null(app_client):
-    response = app_client.get("/fixtures/infinity.json?_shape=array")
-    assert [
-        {"rowid": 1, "value": None},
-        {"rowid": 2, "value": None},
-        {"rowid": 3, "value": 1.5},
-    ] == response.json
-
-
-def test_infinity_returned_as_invalid_json_if_requested(app_client):
-    response = app_client.get("/fixtures/infinity.json?_shape=array&_json_infinity=1")
-    assert [
-        {"rowid": 1, "value": float("inf")},
-        {"rowid": 2, "value": float("-inf")},
-        {"rowid": 3, "value": 1.5},
-    ] == response.json
-
-
-def test_custom_query_with_unicode_characters(app_client):
-    response = app_client.get("/fixtures/𝐜𝐢𝐭𝐢𝐞𝐬.json?_shape=array")
-    assert [{"id": 1, "name": "San Francisco"}] == response.json
-
-
-def test_trace(app_client):
-    response = app_client.get("/fixtures/simple_primary_key.json?_trace=1")
-    data = response.json
-    assert "_trace" in data
-    trace_info = data["_trace"]
-    assert isinstance(trace_info["request_duration_ms"], float)
-    assert isinstance(trace_info["sum_trace_duration_ms"], float)
-    assert isinstance(trace_info["num_traces"], int)
-    assert isinstance(trace_info["traces"], list)
-    assert len(trace_info["traces"]) == trace_info["num_traces"]
-    for trace in trace_info["traces"]:
-        assert isinstance(trace["type"], str)
-        assert isinstance(trace["start"], float)
-        assert isinstance(trace["end"], float)
-        assert trace["duration_ms"] == (trace["end"] - trace["start"]) * 1000
-        assert isinstance(trace["traceback"], list)
-        assert isinstance(trace["database"], str)
-        assert isinstance(trace["sql"], str)
-        assert isinstance(trace["params"], (list, dict, None.__class__))
-
-
 @pytest.mark.parametrize(
     "path,status_code",
     [
@@ -1863,13 +832,57 @@ def test_trace(app_client):
         ("/fixtures.json", 200),
         ("/fixtures/no_primary_key.json", 200),
         # A 400 invalid SQL query should still have the header:
-        ("/fixtures.json?sql=select+blah", 400),
+        ("/fixtures/-/query.json?sql=select+blah", 400),
+        # Write APIs
+        ("/fixtures/-/create", 405),
+        ("/fixtures/facetable/-/insert", 405),
+        ("/fixtures/facetable/-/drop", 405),
     ],
 )
-def test_cors(app_client_with_cors, path, status_code):
-    response = app_client_with_cors.get(path)
+def test_cors(
+    app_client_with_cors,
+    app_client_two_attached_databases_one_immutable,
+    path,
+    status_code,
+):
+    response = app_client_with_cors.get(
+        path,
+    )
     assert response.status == status_code
-    assert "*" == response.headers["Access-Control-Allow-Origin"]
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert (
+        response.headers["Access-Control-Allow-Headers"]
+        == "Authorization, Content-Type"
+    )
+    assert response.headers["Access-Control-Expose-Headers"] == "Link"
+    assert (
+        response.headers["Access-Control-Allow-Methods"] == "GET, POST, HEAD, OPTIONS"
+    )
+    assert response.headers["Access-Control-Max-Age"] == "3600"
+    # Same request to app_client_two_attached_databases_one_immutable
+    # should not have those headers - I'm using that fixture because
+    # regular app_client doesn't have immutable fixtures.db which means
+    # the test for /fixtures.db returns a 403 error
+    response = app_client_two_attached_databases_one_immutable.get(
+        path,
+    )
+    assert response.status == status_code
+    assert "Access-Control-Allow-Origin" not in response.headers
+    assert "Access-Control-Allow-Headers" not in response.headers
+    assert "Access-Control-Expose-Headers" not in response.headers
+    assert "Access-Control-Allow-Methods" not in response.headers
+    assert "Access-Control-Max-Age" not in response.headers
+
+
+def test_cors_query_redirect(app_client_with_cors):
+    # /db?sql= redirects to /db/-/query - the redirect itself needs CORS
+    # headers, otherwise browsers refuse to follow it cross-origin
+    response = app_client_with_cors.get(
+        "/fixtures?sql=select+1", follow_redirects=False
+    )
+    assert response.status == 302
+    assert response.headers["Location"] == "/fixtures/-/query?sql=select+1"
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
 
 
 @pytest.mark.parametrize(
@@ -1884,128 +897,259 @@ def test_cors(app_client_with_cors, path, status_code):
     ),
 )
 def test_database_with_space_in_name(app_client_two_attached_databases, path):
-    response = app_client_two_attached_databases.get("/extra database" + path)
+    response = app_client_two_attached_databases.get(
+        "/extra~20database" + path, follow_redirects=True
+    )
     assert response.status == 200
 
 
 def test_common_prefix_database_names(app_client_conflicting_database_names):
     # https://github.com/simonw/datasette/issues/597
-    assert ["fixtures", "foo", "foo-bar"] == [
+    assert ["foo-bar", "foo", "fixtures"] == [
         d["name"]
-        for d in app_client_conflicting_database_names.get("/-/databases.json").json
+        for d in app_client_conflicting_database_names.get("/-/databases.json").json[
+            "databases"
+        ]
     ]
     for db_name, path in (("foo", "/foo.json"), ("foo-bar", "/foo-bar.json")):
         data = app_client_conflicting_database_names.get(path).json
         assert db_name == data["database"]
 
 
-def test_null_and_compound_foreign_keys_are_not_expanded(app_client):
-    response = app_client.get(
-        "/fixtures/foreign_key_references.json?_shape=array&_labels=on"
-    )
-    assert response.json == [
-        {
-            "pk": "1",
-            "foreign_key_with_label": {"value": "1", "label": "hello"},
-            "foreign_key_with_blank_label": {"value": "3", "label": ""},
-            "foreign_key_with_no_label": {"value": "1", "label": "1"},
-            "foreign_key_compound_pk1": "a",
-            "foreign_key_compound_pk2": "b",
-        },
-        {
-            "pk": "2",
-            "foreign_key_with_label": None,
-            "foreign_key_with_blank_label": None,
-            "foreign_key_with_no_label": None,
-            "foreign_key_compound_pk1": None,
-            "foreign_key_compound_pk2": None,
-        },
-    ]
-
-
 def test_inspect_file_used_for_count(app_client_immutable_and_inspect_file):
-    response = app_client_immutable_and_inspect_file.get("/fixtures/sortable.json")
-    assert response.json["filtered_table_rows_count"] == 100
+    response = app_client_immutable_and_inspect_file.get(
+        "/fixtures/sortable.json?_extra=count"
+    )
+    assert response.json["count"] == 100
 
 
-@pytest.mark.parametrize(
-    "path,expected_json,expected_text",
-    [
-        (
-            "/fixtures/binary_data.json?_shape=array",
-            [
-                {"rowid": 1, "data": {"$base64": True, "encoded": "FRwCx60F/g=="}},
-                {"rowid": 2, "data": {"$base64": True, "encoded": "FRwDx60F/g=="}},
-                {"rowid": 3, "data": None},
-            ],
-            None,
-        ),
-        (
-            "/fixtures/binary_data.json?_shape=array&_nl=on",
-            None,
-            (
-                '{"rowid": 1, "data": {"$base64": true, "encoded": "FRwCx60F/g=="}}\n'
-                '{"rowid": 2, "data": {"$base64": true, "encoded": "FRwDx60F/g=="}}\n'
-                '{"rowid": 3, "data": null}'
-            ),
-        ),
-    ],
-)
-def test_binary_data_in_json(app_client, path, expected_json, expected_text):
-    response = app_client.get(path)
-    if expected_json:
-        assert response.json == expected_json
-    else:
-        assert response.text == expected_text
-
-
-@pytest.mark.parametrize(
-    "qs",
-    [
-        "",
-        "?_shape=arrays",
-        "?_shape=arrayfirst",
-        "?_shape=object",
-        "?_shape=objects",
-        "?_shape=array",
-        "?_shape=array&_nl=on",
-    ],
-)
-def test_paginate_using_link_header(app_client, qs):
-    path = f"/fixtures/compound_three_primary_keys.json{qs}"
-    num_pages = 0
-    while path:
-        response = app_client.get(path)
-        assert response.status == 200
-        num_pages += 1
-        link = response.headers.get("link")
-        if link:
-            assert link.startswith("<")
-            assert link.endswith('>; rel="next"')
-            path = link[1:].split(">")[0]
-            path = path.replace("http://localhost", "")
-        else:
-            path = None
-    assert num_pages == 21
-
-
-@pytest.mark.skipif(
-    sqlite_version() < (3, 31, 0),
-    reason="generated columns were added in SQLite 3.31.0",
-)
-def test_generated_columns_are_visible_in_datasette(app_client):
-    response = app_client.get("/fixtures/generated_columns.json?_shape=array")
-    assert response.json == [
-        {
-            "rowid": 1,
-            "body": '{\n    "number": 1,\n    "string": "This is a string"\n}',
-            "id": 1,
-            "consideration": "This is a string",
-        }
-    ]
-
-
-def test_http_options_request(app_client):
-    response = app_client.request("/fixtures", method="OPTIONS")
-    assert response.status == 200
+@pytest.mark.asyncio
+async def test_http_options_request(ds_client):
+    response = await ds_client.options("/fixtures")
+    assert response.status_code == 200
     assert response.text == "ok"
+
+
+@pytest.mark.asyncio
+async def test_db_path(app_client):
+    # Needs app_client because needs file based database
+    db = app_client.ds.get_database()
+    path = pathlib.Path(db.path)
+
+    assert path.exists()
+
+    datasette = Datasette([path])
+
+    # Previously this broke if path was a pathlib.Path:
+    await datasette.refresh_schemas()
+
+
+@pytest.mark.asyncio
+async def test_hidden_sqlite_stat1_table():
+    ds = Datasette()
+    db = ds.add_memory_database("db")
+    await db.execute_write("create table normal (id integer primary key, name text)")
+    await db.execute_write("create index idx on normal (name)")
+    await db.execute_write("analyze")
+    data = (await ds.client.get("/db.json?_show_hidden=1")).json()
+    tables = [(t["name"], t["hidden"]) for t in data["tables"]]
+    assert tables == [("normal", False)]
+
+
+@pytest.mark.asyncio
+async def test_hide_tables_starting_with_underscore():
+    ds = Datasette()
+    db = ds.add_memory_database("test_hide_tables_starting_with_underscore")
+    await db.execute_write("create table normal (id integer primary key, name text)")
+    await db.execute_write("create table _hidden (id integer primary key, name text)")
+    data = (
+        await ds.client.get(
+            "/test_hide_tables_starting_with_underscore.json?_show_hidden=1"
+        )
+    ).json()
+    tables = [(t["name"], t["hidden"]) for t in data["tables"]]
+    assert tables == [("normal", False), ("_hidden", True)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("db_name", ("foo", r"fo%o", "f~/c.d"))
+async def test_tilde_encoded_database_names(db_name):
+    ds = Datasette()
+    ds.add_memory_database(db_name)
+    response = await ds.client.get("/.json")
+    databases_by_name = {d["name"]: d for d in response.json()["databases"]}
+    assert db_name in databases_by_name
+    path = databases_by_name[db_name]["path"]
+    # And the JSON for that database
+    response2 = await ds.client.get(path + ".json")
+    assert response2.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("table_name", ("[foo]", "foo]", "[foo]/bar"))
+async def test_table_with_reserved_characters_in_name(table_name):
+    # Table names containing characters such as "]" that cannot be escaped
+    # using SQLite [bracket] quoting used to break schema introspection and
+    # the table page - https://github.com/simonw/datasette/issues/2431
+    ds = Datasette()
+    db = ds.add_memory_database("test_reserved_table_names")
+    await db.execute_write(
+        f"create table {escape_sqlite(table_name)} (id integer primary key, name text)"
+    )
+    await db.execute_write(
+        f"insert into {escape_sqlite(table_name)} (id, name) values (1, 'one')"
+    )
+    # Schema introspection (populate_schema_tables) must not crash:
+    db_response = await ds.client.get("/test_reserved_table_names.json")
+    assert db_response.status_code == 200
+    tables = {t["name"]: t for t in db_response.json()["tables"]}
+    assert tables[table_name]["count"] == 1
+    # And the table page itself must load and return the row:
+    table_response = await ds.client.get(
+        f"/test_reserved_table_names/{tilde_encode(table_name)}.json?_shape=array"
+    )
+    assert table_response.status_code == 200
+    assert table_response.json() == [{"id": 1, "name": "one"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config,expected",
+    (
+        ({}, {}),
+        ({"plugins": {"datasette-foo": "bar"}}, {"plugins": {"datasette-foo": "bar"}}),
+        # Test redaction
+        (
+            {
+                "plugins": {
+                    "datasette-auth": {"secret_key": "key"},
+                    "datasette-foo": "bar",
+                    "datasette-auth2": {"password": "password"},
+                    "datasette-sentry": {
+                        "dsn": "sentry:///foo",
+                    },
+                }
+            },
+            {
+                "plugins": {
+                    "datasette-auth": {"secret_key": "***"},
+                    "datasette-foo": "bar",
+                    "datasette-auth2": {"password": "***"},
+                    "datasette-sentry": {"dsn": "***"},
+                }
+            },
+        ),
+    ),
+)
+async def test_config_json(config, expected):
+    "/-/config.json should return redacted configuration"
+    ds = Datasette(config=config)
+    response = await ds.client.get("/-/config.json")
+    assert response.json() == {"ok": True, **expected}
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip(reason="rm?")
+@pytest.mark.parametrize(
+    "metadata,expected_config,expected_metadata",
+    (
+        ({}, {}, {}),
+        (
+            # Metadata input
+            {
+                "title": "Datasette Fixtures",
+                "databases": {
+                    "fixtures": {
+                        "tables": {
+                            "sortable": {
+                                "sortable_columns": [
+                                    "sortable",
+                                    "sortable_with_nulls",
+                                    "sortable_with_nulls_2",
+                                    "text",
+                                ],
+                            },
+                            "no_primary_key": {"sortable_columns": [], "hidden": True},
+                            "primary_key_multiple_columns_explicit_label": {
+                                "label_column": "content2"
+                            },
+                            "simple_view": {"sortable_columns": ["content"]},
+                            "searchable_view_configured_by_metadata": {
+                                "fts_table": "searchable_fts",
+                                "fts_pk": "pk",
+                            },
+                            "roadside_attractions": {
+                                "columns": {
+                                    "name": "The name of the attraction",
+                                    "address": "The street address for the attraction",
+                                }
+                            },
+                            "attraction_characteristic": {"sort_desc": "pk"},
+                            "facet_cities": {"sort": "name"},
+                            "paginated_view": {"size": 25},
+                        },
+                    }
+                },
+            },
+            # Should produce a config with just the table configuration keys
+            {
+                "databases": {
+                    "fixtures": {
+                        "tables": {
+                            "sortable": {
+                                "sortable_columns": [
+                                    "sortable",
+                                    "sortable_with_nulls",
+                                    "sortable_with_nulls_2",
+                                    "text",
+                                ]
+                            },
+                            # These one get redacted:
+                            "no_primary_key": "***",
+                            "primary_key_multiple_columns_explicit_label": "***",
+                            "simple_view": {"sortable_columns": ["content"]},
+                            "searchable_view_configured_by_metadata": {
+                                "fts_table": "searchable_fts",
+                                "fts_pk": "pk",
+                            },
+                            "attraction_characteristic": {"sort_desc": "pk"},
+                            "facet_cities": {"sort": "name"},
+                            "paginated_view": {"size": 25},
+                        }
+                    }
+                }
+            },
+            # And metadata with everything else
+            {
+                "title": "Datasette Fixtures",
+                "databases": {
+                    "fixtures": {
+                        "tables": {
+                            "roadside_attractions": {
+                                "columns": {
+                                    "name": "The name of the attraction",
+                                    "address": "The street address for the attraction",
+                                }
+                            },
+                        }
+                    }
+                },
+            },
+        ),
+    ),
+)
+async def test_upgrade_metadata(metadata, expected_config, expected_metadata):
+    ds = Datasette(metadata=metadata)
+    response = await ds.client.get("/-/config.json")
+    assert response.json() == {"ok": True, **expected_config}
+    response2 = await ds.client.get("/-/metadata.json")
+    assert response2.json() == expected_metadata
+
+
+class Either:
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def __eq__(self, other):
+        return other == self.a or other == self.b

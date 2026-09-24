@@ -7,6 +7,10 @@ Datasette includes some pages and JSON API endpoints for introspecting the curre
 
 Each of these pages can be viewed in your browser. Add ``.json`` to the URL to get back the contents as JSON.
 
+JSON responses that return an object include an ``"ok": true`` key, consistent with the rest of the :ref:`JSON API <json_api>`.
+
+The introspection endpoints documented on this page are covered by the :ref:`JSON API stability promise <json_api_stability>`, with the exception of the debug endpoints ``/-/threads``, ``/-/tasks`` and ``/-/actions``, whose shapes may change in future releases.
+
 .. _JsonDataView_metadata:
 
 /-/metadata
@@ -37,12 +41,13 @@ Shows the version of Datasette, Python and SQLite. `Versions example <https://la
 .. code-block:: json
 
     {
+        "ok": true,
         "datasette": {
-            "version": "0.21"
+            "version": "0.60"
         },
         "python": {
-            "full": "3.6.5 (default, May  5 2018, 03:07:21) \n[GCC 6.3.0 20170516]",
-            "version": "3.6.5"
+            "full": "3.8.12 (default, Dec 21 2021, 10:45:09) \n[GCC 10.2.1 20210110]",
+            "version": "3.8.12"
         },
         "sqlite": {
             "extensions": {
@@ -62,7 +67,7 @@ Shows the version of Datasette, Python and SQLite. `Versions example <https://la
                 "ENABLE_RTREE",
                 "THREADSAFE=1"
             ],
-            "version": "3.16.2"
+            "version": "3.37.0"
         }
     }
 
@@ -71,7 +76,7 @@ Shows the version of Datasette, Python and SQLite. `Versions example <https://la
 /-/plugins
 ----------
 
-Shows a list of currently installed plugins and their versions. `Plugins example <https://san-francisco.datasettes.com/-/plugins>`_:
+Shows a list of currently installed plugins and their versions. `Plugins example <https://datasette.io/-/plugins>`_:
 
 .. code-block:: json
 
@@ -87,7 +92,7 @@ Shows a list of currently installed plugins and their versions. `Plugins example
 
 Add ``?all=1`` to include details of the default plugins baked into Datasette.
 
-.. _JsonDataView_config:
+.. _JsonDataView_settings:
 
 /-/settings
 -----------
@@ -97,6 +102,7 @@ Shows the :ref:`settings` for this instance of Datasette. `Settings example <htt
 .. code-block:: json
 
     {
+        "ok": true,
         "default_facet_size": 30,
         "default_page_size": 100,
         "facet_suggest_time_limit_ms": 50,
@@ -105,36 +111,152 @@ Shows the :ref:`settings` for this instance of Datasette. `Settings example <htt
         "sql_time_limit_ms": 1000
     }
 
+.. _JsonDataView_config:
+
+/-/config
+---------
+
+Shows the :ref:`configuration <configuration>` for this instance of Datasette. This is generally the contents of the :ref:`datasette.yaml or datasette.json <configuration_reference>` file, which can include plugin configuration as well. `Config example <https://latest.datasette.io/-/config>`_:
+
+.. code-block:: json
+
+    {
+        "ok": true,
+        "settings": {
+            "template_debug": true,
+            "trace_debug": true,
+            "force_https_urls": true
+        }
+    }
+
+Any keys that include the one of the following substrings in their names will be returned as redacted ``***`` output, to help avoid accidentally leaking private configuration information: ``secret``, ``key``, ``password``, ``token``, ``hash``, ``dsn``.
+
 .. _JsonDataView_databases:
 
 /-/databases
 ------------
 
-Shows currently attached databases. `Databases example <https://latest.datasette.io/-/databases>`_:
+Shows currently attached databases that the current actor is allowed to view, based on the ``view-database`` permission. `Databases example <https://latest.datasette.io/-/databases>`_:
 
 .. code-block:: json
 
-    [
-        {
-            "hash": null,
-            "is_memory": false,
-            "is_mutable": true,
-            "name": "fixtures",
-            "path": "fixtures.db",
-            "size": 225280
-        }
-    ]
+    {
+        "ok": true,
+        "databases": [
+            {
+                "hash": null,
+                "is_memory": false,
+                "is_mutable": true,
+                "name": "fixtures",
+                "path": "fixtures.db",
+                "size": 225280
+            }
+        ]
+    }
+
+.. _JsonDataView_actions:
+
+/-/actions
+----------
+
+Shows all actions registered with the permission system, including those added by plugins. Requires the ``permissions-debug`` permission.
+
+.. code-block:: json
+
+    {
+        "ok": true,
+        "actions": [
+            {
+                "name": "view-instance",
+                "abbr": "vi",
+                "description": "View Datasette instance",
+                "takes_parent": false,
+                "takes_child": false,
+                "resource_class": null,
+                "also_requires": null
+            }
+        ]
+    }
+
+.. _JumpView:
+
+/-/jump
+-------
+
+Returns a JSON list of items that the current actor has permission to view for Datasette's jump menu. By default this includes visible databases, tables, views and stored queries, and plugins can contribute additional items.
+
+Each item includes a ``type`` string used as a category label in the menu. Items can also include an optional ``description`` with longer text describing that individual result.
+
+The endpoint supports a ``?q=`` query parameter for filtering items by name.
+
+`Jump example <https://latest.datasette.io/-/jump>`_:
+
+.. code-block:: json
+
+    {
+        "ok": true,
+        "matches": [
+            {
+                "name": "fixtures",
+                "url": "/fixtures",
+                "type": "database",
+                "description": null
+            },
+            {
+                "name": "fixtures: facetable",
+                "url": "/fixtures/facetable",
+                "type": "table",
+                "description": null
+            },
+            {
+                "name": "fixtures: recent_releases",
+                "url": "/fixtures/recent_releases",
+                "type": "query",
+                "description": null
+            }
+        ],
+        "truncated": false
+    }
+
+Search example with ``?q=facet`` returns only items matching ``.*facet.*``:
+
+.. code-block:: json
+
+    {
+        "ok": true,
+        "matches": [
+            {
+                "name": "fixtures: facetable",
+                "url": "/fixtures/facetable",
+                "type": "table",
+                "description": null
+            }
+        ],
+        "truncated": false
+    }
+
+When multiple search terms are provided (e.g., ``?q=user+profile``), items must match the pattern ``.*user.*profile.*``. Results are ordered by relevance, then by item type and shortest display name.
+
+.. _AutocompleteDebugView:
+
+/-/debug/autocomplete
+---------------------
+
+The debug tool at ``/-/debug/autocomplete`` can be used to try out the autocomplete component against a specific table. Pass ``?database=db&table=table`` to display an autocomplete field backed by that table's ``/-/autocomplete`` endpoint.
+
+Without those query string arguments, the page lists up to five tables with detected label columns, scanning at most 100 tables.
 
 .. _JsonDataView_threads:
 
 /-/threads
 ----------
 
-Shows details of threads and ``asyncio`` tasks. `Threads example <https://latest.datasette.io/-/threads>`_:
+Shows details of threads and ``asyncio`` tasks. This endpoint requires the ``permissions-debug`` permission, since it exposes runtime internals. `Threads example <https://latest.datasette.io/-/threads>`_:
 
 .. code-block:: json
 
     {
+        "ok": true,
         "num_threads": 2,
         "threads": [
             {
@@ -156,6 +278,42 @@ Shows details of threads and ``asyncio`` tasks. `Threads example <https://latest
         ]
     }
 
+.. _JsonDataView_tasks:
+
+/-/tasks
+--------
+
+Shows the state of every supervised background task registered with :ref:`datasette.add_background_task() <datasette_add_background_task>`; see also :ref:`BackgroundTask <BackgroundTask>` for what each field below means, and :ref:`datasette_lifecycle` for when tasks are launched. This endpoint requires the ``permissions-debug`` permission, since a crashed task's ``exception`` field can reveal internals such as file paths or query text:
+
+.. code-block:: json
+
+    {
+        "ok": true,
+        "tasks": [
+            {
+                "name": "my_plugin.poll_for_updates",
+                "state": "running",
+                "function": "my_plugin.poll_for_updates",
+                "started_at": "2026-07-30T12:00:00+00:00",
+                "exception": null
+            },
+            {
+                "name": "my_plugin.broken_task",
+                "state": "crashed",
+                "function": "my_plugin.broken_task",
+                "started_at": "2026-07-30T12:00:00+00:00",
+                "exception": "ValueError('something went wrong')"
+            }
+        ],
+        "launched": true
+    }
+
+Each entry's ``function`` identifies the callable by its dotted module and qualified name.
+
+Each entry's ``state`` is one of ``registered`` (added but not yet launched), ``running``, ``completed``, ``crashed`` or ``cancelled``. ``exception`` is a one-line ``repr()`` of the exception for a ``crashed`` task, or ``null`` otherwise - the full traceback is written to the ``datasette.background_tasks`` logger instead, to keep this payload skimmable.
+
+The top-level ``launched`` flag reports whether the instance has run its one-time background task launch (after ``startup`` hooks finish, or via lifespan/first-request/:ref:`start_background_tasks() <datasette_start_background_tasks>`). It distinguishes "no tasks have been registered" (``tasks`` is empty either way) from "tasks are registered but nothing has armed the launch yet" (``launched`` is ``false`` and every task's ``state`` is still ``registered``) - useful when debugging a host that never triggers Datasette's lifespan events.
+
 .. _JsonDataView_actor:
 
 /-/actor
@@ -166,6 +324,7 @@ Shows the currently authenticated actor. Useful for debugging Datasette authenti
 .. code-block:: json
 
     {
+        "ok": true,
         "actor": {
             "id": 1,
             "username": "some-user"

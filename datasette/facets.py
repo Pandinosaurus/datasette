@@ -1,20 +1,19 @@
 import json
 import urllib
-import re
+
 from datasette import hookimpl
 from datasette.database import QueryInterrupted
 from datasette.utils import (
+    detect_json1,
     escape_sqlite,
     path_with_added_args,
     path_with_removed_args,
-    detect_json1,
-    InvalidSql,
     sqlite3,
 )
 
 
-def load_facet_configs(request, table_metadata):
-    # Given a request and the metadata configuration for a table, return
+def load_facet_configs(request, table_config):
+    # Given a request and the configuration for a table, return
     # a dictionary of selected facets, their lists of configs and for each
     # config whether it came from the request or the metadata.
     #
@@ -22,21 +21,21 @@ def load_facet_configs(request, table_metadata):
     #       {"source": "metadata", "config": config1},
     #       {"source": "request", "config": config2}]}
     facet_configs = {}
-    table_metadata = table_metadata or {}
-    metadata_facets = table_metadata.get("facets", [])
-    for metadata_config in metadata_facets:
-        if isinstance(metadata_config, str):
+    table_config = table_config or {}
+    table_facet_configs = table_config.get("facets", [])
+    for facet_config in table_facet_configs:
+        if isinstance(facet_config, str):
             type = "column"
-            metadata_config = {"simple": metadata_config}
+            facet_config = {"simple": facet_config}
         else:
             assert (
-                len(metadata_config.values()) == 1
+                len(facet_config.values()) == 1
             ), "Metadata config dicts should be {type: config}"
-            type, metadata_config = metadata_config.items()[0]
-            if isinstance(metadata_config, str):
-                metadata_config = {"simple": metadata_config}
+            type, facet_config = next(iter(facet_config.items()))
+            if isinstance(facet_config, str):
+                facet_config = {"simple": facet_config}
         facet_configs.setdefault(type, []).append(
-            {"source": "metadata", "config": metadata_config}
+            {"source": "metadata", "config": facet_config}
         )
     qs_pairs = urllib.parse.parse_qs(request.query_string, keep_blank_values=True)
     for key, values in qs_pairs.items():
@@ -47,13 +46,12 @@ def load_facet_configs(request, table_metadata):
             elif key.startswith("_facet_"):
                 type = key[len("_facet_") :]
             for value in values:
-                # The value is the config - either JSON or not
-                if value.startswith("{"):
-                    config = json.loads(value)
-                else:
-                    config = {"simple": value}
+                # The value is the facet_config - either JSON or not
+                facet_config = (
+                    json.loads(value) if value.startswith("{") else {"simple": value}
+                )
                 facet_configs.setdefault(type, []).append(
-                    {"source": "request", "config": config}
+                    {"source": "request", "config": facet_config}
                 )
     return facet_configs
 
@@ -68,6 +66,8 @@ def register_facet_classes():
 
 class Facet:
     type = None
+    # How many rows to consider when suggesting facets:
+    suggest_consider = 1000
 
     def __init__(
         self,
@@ -77,29 +77,59 @@ class Facet:
         sql=None,
         table=None,
         params=None,
-        metadata=None,
+        table_config=None,
         row_count=None,
     ):
         assert table or sql, "Must provide either table= or sql="
         self.ds = ds
         self.request = request
         self.database = database
-        # For foreign key expansion. Can be None for e.g. canned SQL queries:
+        # For foreign key expansion. Can be None for e.g. stored SQL queries:
         self.table = table
-        self.sql = sql or f"select * from [{table}]"
+        self.sql = sql or f"select * from {escape_sqlite(table)}"
         self.params = params or []
-        self.metadata = metadata
+        self.table_config = table_config
         # row_count can be None, in which case we calculate it ourselves:
         self.row_count = row_count
 
     def get_configs(self):
-        configs = load_facet_configs(self.request, self.metadata)
+        configs = load_facet_configs(self.request, self.table_config)
         return configs.get(self.type) or []
 
     def get_querystring_pairs(self):
         # ?_foo=bar&_foo=2&empty= becomes:
         # [('_foo', 'bar'), ('_foo', '2'), ('empty', '')]
         return urllib.parse.parse_qsl(self.request.query_string, keep_blank_values=True)
+
+    def get_facet_size(self):
+        facet_size = self.ds.setting("default_facet_size")
+        max_returned_rows = self.ds.setting("max_returned_rows")
+        table_facet_size = None
+        if self.table:
+            config_facet_size = (
+                self.ds.config.get("databases", {})
+                .get(self.database, {})
+                .get("tables", {})
+                .get(self.table, {})
+                .get("facet_size")
+            )
+            if config_facet_size:
+                table_facet_size = config_facet_size
+        custom_facet_size = self.request.args.get("_facet_size")
+        if custom_facet_size:
+            if custom_facet_size == "max":
+                facet_size = max_returned_rows
+            elif custom_facet_size.isdigit():
+                facet_size = int(custom_facet_size)
+            else:
+                # Invalid value, ignore it
+                custom_facet_size = None
+        if table_facet_size and not custom_facet_size:
+            if table_facet_size == "max":
+                facet_size = max_returned_rows
+            else:
+                facet_size = table_facet_size
+        return min(facet_size, max_returned_rows)
 
     async def suggest(self):
         return []
@@ -118,17 +148,6 @@ class Facet:
             )
         ).columns
 
-    async def get_row_count(self):
-        if self.row_count is None:
-            self.row_count = (
-                await self.ds.execute(
-                    self.database,
-                    f"select count(*) from ({self.sql})",
-                    self.params,
-                )
-            ).rows[0][0]
-        return self.row_count
-
 
 class ColumnFacet(Facet):
     type = "column"
@@ -136,21 +155,19 @@ class ColumnFacet(Facet):
     async def suggest(self):
         row_count = await self.get_row_count()
         columns = await self.get_columns(self.sql, self.params)
-        facet_size = self.ds.setting("default_facet_size")
+        facet_size = self.get_facet_size()
         suggested_facets = []
         already_enabled = [c["config"]["simple"] for c in self.get_configs()]
         for column in columns:
             if column in already_enabled:
                 continue
-            suggested_facet_sql = """
-                select {column}, count(*) as n from (
-                    {sql}
-                ) where {column} is not null
-                group by {column}
-                limit {limit}
-            """.format(
-                column=escape_sqlite(column), sql=self.sql, limit=facet_size + 1
-            )
+            suggested_facet_sql = f"""
+                with limited as (select * from ({self.sql}) limit {self.suggest_consider})
+                select {escape_sqlite(column)} as value, count(*) as n from limited
+                where value is not null
+                group by value
+                limit {facet_size + 1}
+            """
             distinct_values = None
             try:
                 distinct_values = await self.ds.execute(
@@ -172,7 +189,11 @@ class ColumnFacet(Facet):
                             "name": column,
                             "toggle_url": self.ds.absolute_url(
                                 self.request,
-                                path_with_added_args(self.request, {"_facet": column}),
+                                self.ds.urls.path(
+                                    path_with_added_args(
+                                        self.request, {"_facet": column}
+                                    )
+                                ),
                             ),
                         }
                     )
@@ -180,13 +201,24 @@ class ColumnFacet(Facet):
                 continue
         return suggested_facets
 
+    async def get_row_count(self):
+        if self.row_count is None:
+            self.row_count = (
+                await self.ds.execute(
+                    self.database,
+                    f"select count(*) from (select * from ({self.sql}) limit {self.suggest_consider})",
+                    self.params,
+                )
+            ).rows[0][0]
+        return self.row_count
+
     async def facet_results(self):
-        facet_results = {}
+        facet_results = []
         facets_timed_out = []
 
         qs_pairs = self.get_querystring_pairs()
 
-        facet_size = self.ds.setting("default_facet_size")
+        facet_size = self.get_facet_size()
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
@@ -197,9 +229,7 @@ class ColumnFacet(Facet):
                 )
                 where {col} is not null
                 group by {col} order by count desc, value limit {limit}
-            """.format(
-                col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1
-            )
+            """.format(col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1)
             try:
                 facet_rows_results = await self.ds.execute(
                     self.database,
@@ -209,34 +239,44 @@ class ColumnFacet(Facet):
                     custom_time_limit=self.ds.setting("facet_time_limit_ms"),
                 )
                 facet_results_values = []
-                facet_results[column] = {
-                    "name": column,
-                    "type": self.type,
-                    "hideable": source != "metadata",
-                    "toggle_url": path_with_removed_args(
-                        self.request, {"_facet": column}
-                    ),
-                    "results": facet_results_values,
-                    "truncated": len(facet_rows_results) > facet_size,
-                }
+                facet_results.append(
+                    {
+                        "name": column,
+                        "type": self.type,
+                        "hideable": source != "metadata",
+                        "toggle_url": self.ds.urls.path(
+                            path_with_removed_args(self.request, {"_facet": column})
+                        ),
+                        "results": facet_results_values,
+                        "truncated": len(facet_rows_results) > facet_size,
+                    }
+                )
                 facet_rows = facet_rows_results.rows[:facet_size]
                 if self.table:
                     # Attempt to expand foreign keys into labels
                     values = [row["value"] for row in facet_rows]
                     expanded = await self.ds.expand_foreign_keys(
-                        self.database, self.table, column, values
+                        self.request.actor, self.database, self.table, column, values
                     )
                 else:
                     expanded = {}
                 for row in facet_rows:
-                    selected = (column, str(row["value"])) in qs_pairs
+                    column_qs = column
+                    if column.startswith("_"):
+                        column_qs = f"{column}__exact"
+                    selected_args = {
+                        key: str(row["value"])
+                        for key in (column_qs, f"{column}__exact")
+                        if (key, str(row["value"])) in qs_pairs
+                    }
+                    selected = bool(selected_args)
                     if selected:
                         toggle_path = path_with_removed_args(
-                            self.request, {column: str(row["value"])}
+                            self.request, selected_args
                         )
                     else:
                         toggle_path = path_with_added_args(
-                            self.request, {column: row["value"]}
+                            self.request, {column_qs: row["value"]}
                         )
                     facet_results_values.append(
                         {
@@ -244,7 +284,7 @@ class ColumnFacet(Facet):
                             "label": expanded.get((column, row["value"]), row["value"]),
                             "count": row["count"],
                             "toggle_url": self.ds.absolute_url(
-                                self.request, toggle_path
+                                self.request, self.ds.urls.path(toggle_path)
                             ),
                             "selected": selected,
                         }
@@ -277,11 +317,14 @@ class ArrayFacet(Facet):
                 continue
             # Is every value in this column either null or a JSON array?
             suggested_facet_sql = """
+                with limited as (select * from ({sql}) limit {suggest_consider})
                 select distinct json_type({column})
-                from ({sql})
+                from limited
                 where {column} is not null and {column} != ''
             """.format(
-                column=escape_sqlite(column), sql=self.sql
+                column=escape_sqlite(column),
+                sql=self.sql,
+                suggest_consider=self.suggest_consider,
             )
             try:
                 results = await self.ds.execute(
@@ -294,18 +337,18 @@ class ArrayFacet(Facet):
                 )
                 types = tuple(r[0] for r in results.rows)
                 if types in (("array",), ("array", None)):
-                    # Now sanity check that first 100 arrays contain only strings
+                    # Now check that first 100 arrays contain only strings
                     first_100 = [
                         v[0]
                         for v in await self.ds.execute(
                             self.database,
                             (
-                                "select {column} from ({sql}) "
-                                "where {column} is not null "
-                                "and {column} != '' "
-                                "and json_array_length({column}) > 0 "
+                                f"select {escape_sqlite(column)} from ({self.sql}) "
+                                f"where {escape_sqlite(column)} is not null "
+                                f"and {escape_sqlite(column)} != '' "
+                                f"and json_array_length({escape_sqlite(column)}) > 0 "
                                 "limit 100"
-                            ).format(column=escape_sqlite(column), sql=self.sql),
+                            ),
                             self.params,
                             truncate=False,
                             custom_time_limit=self.ds.setting(
@@ -323,8 +366,10 @@ class ArrayFacet(Facet):
                                 "type": "array",
                                 "toggle_url": self.ds.absolute_url(
                                     self.request,
-                                    path_with_added_args(
-                                        self.request, {"_facet_array": column}
+                                    self.ds.urls.path(
+                                        path_with_added_args(
+                                            self.request, {"_facet_array": column}
+                                        )
                                     ),
                                 ),
                             }
@@ -335,22 +380,35 @@ class ArrayFacet(Facet):
 
     async def facet_results(self):
         # self.configs should be a plain list of columns
-        facet_results = {}
+        facet_results = []
         facets_timed_out = []
 
-        facet_size = self.ds.setting("default_facet_size")
+        facet_size = self.get_facet_size()
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
             column = config.get("column") or config["simple"]
-            facet_sql = """
-                select j.value as value, count(*) as count from (
-                    {sql}
-                ) join json_each({col}) j
-                group by j.value order by count desc, value limit {limit}
-            """.format(
-                col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1
-            )
+            # https://github.com/simonw/datasette/issues/448
+            facet_sql = f"""
+                with inner as ({self.sql}),
+                deduped_array_items as (
+                    select
+                        distinct j.value,
+                        inner.*
+                    from
+                        json_each([inner].{escape_sqlite(column)}) j
+                        join inner
+                )
+                select
+                    value as value,
+                    count(*) as count
+                from
+                    deduped_array_items
+                group by
+                    value
+                order by
+                    count(*) desc, value limit {facet_size + 1}
+            """
             try:
                 facet_rows_results = await self.ds.execute(
                     self.database,
@@ -360,16 +418,20 @@ class ArrayFacet(Facet):
                     custom_time_limit=self.ds.setting("facet_time_limit_ms"),
                 )
                 facet_results_values = []
-                facet_results[column] = {
-                    "name": column,
-                    "type": self.type,
-                    "results": facet_results_values,
-                    "hideable": source != "metadata",
-                    "toggle_url": path_with_removed_args(
-                        self.request, {"_facet_array": column}
-                    ),
-                    "truncated": len(facet_rows_results) > facet_size,
-                }
+                facet_results.append(
+                    {
+                        "name": column,
+                        "type": self.type,
+                        "results": facet_results_values,
+                        "hideable": source != "metadata",
+                        "toggle_url": self.ds.urls.path(
+                            path_with_removed_args(
+                                self.request, {"_facet_array": column}
+                            )
+                        ),
+                        "truncated": len(facet_rows_results) > facet_size,
+                    }
+                )
                 facet_rows = facet_rows_results.rows[:facet_size]
                 pairs = self.get_querystring_pairs()
                 for row in facet_rows:
@@ -413,11 +475,9 @@ class DateFacet(Facet):
             # Does this column contain any dates in the first 100 rows?
             suggested_facet_sql = """
                 select date({column}) from (
-                    {sql}
-                ) where {column} glob "????-??-*" limit 100;
-            """.format(
-                column=escape_sqlite(column), sql=self.sql
-            )
+                    select * from ({sql}) limit 100
+                ) where {column} glob "????-??-*"
+            """.format(column=escape_sqlite(column), sql=self.sql)
             try:
                 results = await self.ds.execute(
                     self.database,
@@ -435,8 +495,10 @@ class DateFacet(Facet):
                             "type": "date",
                             "toggle_url": self.ds.absolute_url(
                                 self.request,
-                                path_with_added_args(
-                                    self.request, {"_facet_date": column}
+                                self.ds.urls.path(
+                                    path_with_added_args(
+                                        self.request, {"_facet_date": column}
+                                    )
                                 ),
                             ),
                         }
@@ -446,10 +508,10 @@ class DateFacet(Facet):
         return suggested_facets
 
     async def facet_results(self):
-        facet_results = {}
+        facet_results = []
         facets_timed_out = []
         args = dict(self.get_querystring_pairs())
-        facet_size = self.ds.setting("default_facet_size")
+        facet_size = self.get_facet_size()
         for source_and_config in self.get_configs():
             config = source_and_config["config"]
             source = source_and_config["source"]
@@ -461,9 +523,7 @@ class DateFacet(Facet):
                 )
                 where date({col}) is not null
                 group by date({col}) order by count desc, value limit {limit}
-            """.format(
-                col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1
-            )
+            """.format(col=escape_sqlite(column), sql=self.sql, limit=facet_size + 1)
             try:
                 facet_rows_results = await self.ds.execute(
                     self.database,
@@ -473,16 +533,18 @@ class DateFacet(Facet):
                     custom_time_limit=self.ds.setting("facet_time_limit_ms"),
                 )
                 facet_results_values = []
-                facet_results[column] = {
-                    "name": column,
-                    "type": self.type,
-                    "results": facet_results_values,
-                    "hideable": source != "metadata",
-                    "toggle_url": path_with_removed_args(
-                        self.request, {"_facet_date": column}
-                    ),
-                    "truncated": len(facet_rows_results) > facet_size,
-                }
+                facet_results.append(
+                    {
+                        "name": column,
+                        "type": self.type,
+                        "results": facet_results_values,
+                        "hideable": source != "metadata",
+                        "toggle_url": path_with_removed_args(
+                            self.request, {"_facet_date": column}
+                        ),
+                        "truncated": len(facet_rows_results) > facet_size,
+                    }
+                )
                 facet_rows = facet_rows_results.rows[:facet_size]
                 for row in facet_rows:
                     selected = str(args.get(f"{column}__date")) == str(row["value"])

@@ -1,5 +1,6 @@
-from .utils import path_with_format, HASH_LENGTH, PrefixedUrlString
 import urllib
+
+from .utils import PrefixedUrlString, path_with_format, tilde_encode
 
 
 class Urls:
@@ -8,8 +9,7 @@ class Urls:
 
     def path(self, path, format=None):
         if not isinstance(path, PrefixedUrlString):
-            if path.startswith("/"):
-                path = path[1:]
+            path = path.removeprefix("/")
             path = self.ds.setting("base_url") + path
         if format is not None:
             path = path_with_format(path=path, format=format)
@@ -28,23 +28,23 @@ class Urls:
         return self.path("-/logout")
 
     def database(self, database, format=None):
-        db = self.ds.databases[database]
-        if self.ds.setting("hash_urls") and db.hash:
-            path = self.path(
-                f"{urllib.parse.quote(database)}-{db.hash[:HASH_LENGTH]}", format=format
-            )
-        else:
-            path = self.path(urllib.parse.quote(database), format=format)
-        return path
+        db = self.ds.get_database(database)
+        return self.path(tilde_encode(db.route), format=format)
+
+    def database_query(self, database, sql, format=None):
+        path = f"{self.database(database)}/-/query?" + urllib.parse.urlencode(
+            {"sql": sql}
+        )
+        return self.path(path, format=format)
 
     def table(self, database, table, format=None):
-        path = f"{self.database(database)}/{urllib.parse.quote_plus(table)}"
+        path = f"{self.database(database)}/{tilde_encode(table)}"
         if format is not None:
             path = path_with_format(path=path, format=format)
         return PrefixedUrlString(path)
 
     def query(self, database, query, format=None):
-        path = f"{self.database(database)}/{urllib.parse.quote_plus(query)}"
+        path = f"{self.database(database)}/{tilde_encode(query)}"
         if format is not None:
             path = path_with_format(path=path, format=format)
         return PrefixedUrlString(path)
@@ -56,6 +56,7 @@ class Urls:
         return PrefixedUrlString(path)
 
     def row_blob(self, database, table, row_path, column):
-        return self.table(database, table) + "/{}.blob?_blob_column={}".format(
-            row_path, urllib.parse.quote_plus(column)
+        return (
+            self.table(database, table)
+            + f"/{row_path}.blob?_blob_column={urllib.parse.quote_plus(column)}"
         )

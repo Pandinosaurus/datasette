@@ -4,22 +4,39 @@
  Authentication and permissions
 ================================
 
-Datasette does not require authentication by default. Any visitor to a Datasette instance can explore the full data and execute read-only SQL queries.
+Datasette doesn't require authentication by default. Any visitor to a Datasette instance can explore the full data and execute read-only SQL queries.
 
-Datasette's plugin system can be used to add many different styles of authentication, such as user accounts, single sign-on or API keys.
+Datasette can be configured to only allow authenticated users, or to control which databases, tables, and queries can be accessed by the public or by specific users. Datasette's plugin system can be used to add many different styles of authentication, such as user accounts, single sign-on or API keys.
 
 .. _authentication_actor:
 
 Actors
 ======
 
-Through plugins, Datasette can support both authenticated users (with cookies) and authenticated API agents (via authentication tokens). The word "actor" is used to cover both of these cases.
+Through plugins, Datasette can support both authenticated users (with cookies) and authenticated API clients (via authentication tokens). The word "actor" is used to cover both of these cases.
 
-Every request to Datasette has an associated actor value, available in the code as ``request.actor``. This can be ``None`` for unauthenticated requests, or a JSON compatible Python dictionary for authenticated users or API agents.
+Every request to Datasette has an associated actor value, available in the code as ``request.actor``. This can be ``None`` for unauthenticated requests, or a JSON compatible Python dictionary for authenticated users or API clients.
 
-The actor dictionary can be any shape - the design of that data structure is left up to the plugins. A useful convention is to include an ``"id"`` string, as demonstrated by the "root" actor below.
+The actor dictionary can be any shape - the design of that data structure is left up to the plugins. Actors should always include a unique ``"id"`` string, as demonstrated by the "root" actor below.
 
 Plugins can use the :ref:`plugin_hook_actor_from_request` hook to implement custom logic for authenticating an actor based on the incoming HTTP request.
+
+.. _authentication_actor_display:
+
+How actors are displayed
+------------------------
+
+In a number of places - such as the navigation menu and the ``/-/logout`` page - Datasette needs to display a short label representing the currently authenticated actor.
+
+To decide what to show, Datasette looks through the following keys in the actor dictionary and uses the value of the first one that is present and not empty:
+
+* ``display``
+* ``name``
+* ``username``
+* ``login``
+* ``id``
+
+If none of those keys have a value the actor dictionary is displayed as a string instead.
 
 .. _authentication_root:
 
@@ -28,18 +45,33 @@ Using the "root" actor
 
 Datasette currently leaves almost all forms of authentication to plugins - `datasette-auth-github <https://github.com/simonw/datasette-auth-github>`__ for example.
 
-The one exception is the "root" account, which you can sign into while using Datasette on your local machine. This provides access to a small number of debugging features.
+The one exception is the "root" account, which you can sign into while using Datasette on your local machine. The root user starts with **all permissions**: Datasette contributes a global allow rule for every action. More specific deny rules can still override that global rule.
+
+The ``--root`` flag is designed for local development and testing. When you start Datasette with ``--root``, the root user automatically receives every permission, including:
+
+* All view permissions (``view-instance``, ``view-database``, ``view-table``, etc.)
+* All write permissions (``insert-row``, ``update-row``, ``delete-row``, ``create-table``, ``create-view``, ``alter-table``, ``set-column-type``, ``drop-table``, ``drop-view``)
+* Debug permissions (``permissions-debug``, ``debug-menu``)
+* Any custom permissions defined by plugins
+
+If you add explicit deny rules in ``datasette.yaml`` those can still block the
+root actor from specific databases or tables.
+
+The ``--root`` flag sets an internal ``root_enabled`` switch—without it, a signed-in user with ``{"id": "root"}`` is treated like any other actor.
 
 To sign in as root, start Datasette using the ``--root`` command-line option, like this::
 
-    $ datasette --root
+    datasette --root
+
+Datasette will output a single-use-only login URL on startup::
+
     http://127.0.0.1:8001/-/auth-token?token=786fc524e0199d70dc9a581d851f466244e114ca92f33aa3b42a139e9388daa7
     INFO:     Started server process [25801]
     INFO:     Waiting for application startup.
     INFO:     Application startup complete.
     INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
 
-The URL on the first line includes a one-use token which can be used to sign in as the "root" actor in your browser. Click on that link and then visit ``http://127.0.0.1:8001/-/actor`` to confirm that you are authenticated as an actor that looks like this:
+Click on that link and then visit ``http://127.0.0.1:8001/-/actor`` to confirm that you are authenticated as an actor that looks like this:
 
 .. code-block:: json
 
@@ -52,38 +84,185 @@ The URL on the first line includes a one-use token which can be used to sign in 
 Permissions
 ===========
 
-Datasette has an extensive permissions system built-in, which can be further extended and customized by plugins.
-
 The key question the permissions system answers is this:
 
     Is this **actor** allowed to perform this **action**, optionally against this particular **resource**?
 
+Every permission decision can be understood in terms of those three values. Datasette implements the decisions using SQL, but you do not need to understand the generated SQL to configure or debug permissions.
+
 **Actors** are :ref:`described above <authentication_actor>`.
 
-An **action** is a string describing the action the actor would like to perfom. A full list is :ref:`provided below <permissions>` - examples include ``view-table`` and ``execute-sql``.
+An **action** is a string describing the action the actor would like to perform. A full list is :ref:`provided below <actions>` - examples include ``view-table`` and ``execute-sql``.
 
 A **resource** is the item the actor wishes to interact with - for example a specific database or table. Some actions, such as ``permissions-debug``, are not associated with a particular resource.
 
-Datasette's built-in view permissions (``view-database``, ``view-table`` etc) default to *allow* - unless you :ref:`configure additional permission rules <authentication_permissions_metadata>` unauthenticated users will be allowed to access content.
+Datasette's built-in view actions (``view-database``, ``view-table`` etc) are allowed by Datasette's default configuration: unless you :ref:`configure additional permission rules <authentication_permissions_config>` unauthenticated users will be allowed to access content.
 
-Permissions with potentially harmful effects should default to *deny*. Plugin authors should account for this when designing new plugins - for example, the `datasette-upload-csvs <https://github.com/simonw/datasette-upload-csvs>`__ plugin defaults to deny so that installations don't accidentally allow unauthenticated users to create new tables by uploading a CSV file.
+Other actions, including those introduced by plugins, will default to *deny*.
+
+.. _authentication_default_deny:
+
+Denying all permissions by default
+----------------------------------
+
+By default, Datasette allows unauthenticated access to view databases, tables, and execute SQL queries.
+
+You may want to run Datasette in a mode where **all** access is denied by default, and you explicitly grant permissions only to authenticated users, either using the :ref:`--root mechanism <authentication_root>` or through :ref:`configuration file rules <authentication_permissions_config>` or plugins.
+
+Use the ``--default-deny`` command-line option to run Datasette in this mode::
+
+    datasette --default-deny data.db --root
+
+With ``--default-deny`` enabled:
+
+* Anonymous users are denied access to view the instance, databases, tables, and queries
+* Authenticated users are also denied access unless they're explicitly granted permissions
+* The root user (when using ``--root``) still has access to everything
+* You can grant permissions using :ref:`configuration file rules <authentication_permissions_config>` or plugins
+
+For example, to allow only a specific user to access your instance::
+
+    datasette --default-deny data.db --config datasette.yaml
+
+Where ``datasette.yaml`` contains:
+
+.. code-block:: yaml
+
+    allow:
+      id: alice
+
+This configuration will deny access to everyone except the user with ``id`` of ``alice``.
+
+.. _authentication_permissions_explained:
+
+How permissions are resolved
+----------------------------
+
+Permission rules describe an effect (``allow`` or ``deny``) at one of three levels:
+
+``resource``
+    A specific child resource, such as the ``analytics/sales`` table.
+
+``parent``
+    A parent resource, such as the ``analytics`` database. A parent rule also applies to its child resources.
+
+``global``
+    Every resource for that action.
+
+Datasette resolves matching rules from most specific to least specific:
+
+#. Resource rules take precedence over parent and global rules.
+#. Parent rules take precedence over global rules.
+#. If both allow and deny rules match at the same level, deny takes precedence.
+#. If no rule matches, access is denied.
+
+This means a resource-level allow can provide an exception to a parent-level deny. It also means that two plugins which disagree at the same level resolve to deny.
+
+For table and view permissions, resource names use SQLite's case-insensitive
+identifier matching: ``Secret``, ``secret`` and ``SECRET`` identify the same
+table. This applies to configuration rules, plugin rules and token restrictions.
+Only ASCII letters are case-insensitive; non-ASCII characters remain distinct.
+Conflicting rules for different spellings of the same name follow the usual
+deny-wins rule at the same scope. Names retain their original spelling in
+resource listings and permission explanations. Database names, stored query
+names and other resource types remain case-sensitive.
+
+.. list-table:: Permission rule examples
+   :header-rows: 1
+
+   * - Matching rules
+     - Result
+     - Explanation
+   * - Global allow
+     - Allow
+     - The global rule is the most specific matching rule.
+   * - Global allow, parent deny
+     - Deny
+     - The parent rule is more specific.
+   * - Parent deny, resource allow
+     - Allow
+     - The resource rule is more specific.
+   * - Resource allow and resource deny
+     - Deny
+     - Deny takes precedence at the same level.
+   * - No matching rules
+     - Deny
+     - Permissions default to deny when no rule applies.
+
+The built-in public defaults are global allow rules for actions such as ``view-instance``, ``view-database`` and ``view-table``. They follow the same precedence rules as configuration and plugin rules. The ``--default-deny`` option prevents Datasette from contributing those default allow rules.
+
+The built-in ``datasette.default_permissions.sqlite_statistics`` plugin denies
+``view-table`` for ``sqlite_stat1``, ``sqlite_stat2``, ``sqlite_stat3`` and
+``sqlite_stat4``. These table-level denials also apply to root users and take
+precedence over configuration or plugin allow rules at the same scope.
+This controls table access and listings, without changing ``execute-sql`` or
+SQLite's internal use of statistics.
+
+A plugin can replace this policy by unregistering
+``datasette.default_permissions.sqlite_statistics`` through ``datasette.pm``
+and registering its own permission hook. Plugin registration is process-wide:
+replacing this policy affects every Datasette instance in that process.
+
+Datasette performs checks using :ref:`datasette_allowed`, which accepts keyword arguments for ``action``, ``resource`` and an optional ``actor``.
+
+``resource`` should be an instance of the appropriate ``Resource`` subclass from :mod:`datasette.resources`—for example ``InstanceResource()``, ``DatabaseResource(database="...``)`` or ``TableResource(database="...", table="...")``. This defaults to ``InstanceResource()`` if not specified.
+
+When a check runs Datasette gathers allow/deny rules from multiple sources and
+compiles them into a SQL query. The resulting query describes all of the
+resources an actor may access for that action, together with the reasons those
+resources were allowed or denied. The combined sources are:
+
+* ``allow`` blocks configured in :ref:`datasette.yaml <authentication_permissions_config>`.
+* :ref:`Actor restrictions <authentication_cli_create_token_restrict>` encoded into the actor dictionary or API token.
+* The "root" user rule when ``--root`` (or :attr:`Datasette.root_enabled <datasette.app.Datasette.root_enabled>`) is active. This is a global allow rule, so a more specific configuration deny can override it.
+* Any additional SQL provided by plugins implementing :ref:`plugin_hook_permission_resources_sql`.
+
+Actor restrictions are applied after the allow/deny rules. They act as an additional allowlist: a restriction can remove access but cannot grant access that the actor did not already have. See :ref:`authentication_cli_create_token_restrict`.
+
+Some actions have dependencies on other actions. These are evaluated as an ``AND`` condition. For example, ``execute-sql`` also requires ``view-database``: both decisions must be allowed for the final result to be allowed.
 
 .. _authentication_permissions_allow:
 
 Defining permissions with "allow" blocks
 ----------------------------------------
 
-The standard way to define permissions in Datasette is to use an ``"allow"`` block. This is a JSON document describing which actors are allowed to perfom a permission.
+One way to define permissions in Datasette is to use an ``"allow"`` block :ref:`in the datasette.yaml file <authentication_permissions_config>`. This is a JSON document describing which actors are allowed to perform an action against a specific resource.
+
+Each ``allow`` block is compiled into SQL and combined with any
+:ref:`plugin-provided rules <plugin_hook_permission_resources_sql>` to produce
+the cascading allow/deny decisions that power :ref:`datasette_allowed`.
 
 The most basic form of allow block is this (`allow demo <https://latest.datasette.io/-/allow-debug?actor=%7B%22id%22%3A+%22root%22%7D&allow=%7B%0D%0A++++++++%22id%22%3A+%22root%22%0D%0A++++%7D>`__, `deny demo <https://latest.datasette.io/-/allow-debug?actor=%7B%22id%22%3A+%22trevor%22%7D&allow=%7B%0D%0A++++++++%22id%22%3A+%22root%22%0D%0A++++%7D>`__):
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow:
+          id: root
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": {
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow:
+          id: root
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": {
             "id": "root"
+          }
         }
-    }
+.. [[[end]]]
 
 This will match any actors with an ``"id"`` property of ``"root"`` - for example, an actor that looks like this:
 
@@ -96,29 +275,98 @@ This will match any actors with an ``"id"`` property of ``"root"`` - for example
 
 An allow block can specify "deny all" using ``false`` (`demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22root%22%0D%0A%7D&allow=false>`__):
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow: false
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": false
-    }
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow: false
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": false
+        }
+.. [[[end]]]
 
 An ``"allow"`` of ``true`` allows all access (`demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22root%22%0D%0A%7D&allow=true>`__):
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow: true
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": true
-    }
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow: true
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": true
+        }
+.. [[[end]]]
 
 Allow keys can provide a list of values. These will match any actor that has any of those values (`allow demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22cleopaws%22%0D%0A%7D&allow=%7B%0D%0A++++%22id%22%3A+%5B%0D%0A++++++++%22simon%22%2C%0D%0A++++++++%22cleopaws%22%0D%0A++++%5D%0D%0A%7D>`__, `deny demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22pancakes%22%0D%0A%7D&allow=%7B%0D%0A++++%22id%22%3A+%5B%0D%0A++++++++%22simon%22%2C%0D%0A++++++++%22cleopaws%22%0D%0A++++%5D%0D%0A%7D>`__):
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow:
+          id:
+          - simon
+          - cleopaws
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": {
-            "id": ["simon", "cleopaws"]
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow:
+          id:
+          - simon
+          - cleopaws
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": {
+            "id": [
+              "simon",
+              "cleopaws"
+            ]
+          }
         }
-    }
+.. [[[end]]]
 
 This will match any actor with an ``"id"`` of either ``"simon"`` or ``"cleopaws"``.
 
@@ -126,53 +374,154 @@ Actors can have properties that feature a list of values. These will be matched 
 
 .. code-block:: json
 
-    {
-        "id": "simon",
-        "roles": ["staff", "developer"]
-    }
+      {
+          "id": "simon",
+          "roles": ["staff", "developer"]
+      }
 
 This allow block will provide access to any actor that has ``"developer"`` as one of their roles (`allow demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22simon%22%2C%0D%0A++++%22roles%22%3A+%5B%0D%0A++++++++%22staff%22%2C%0D%0A++++++++%22developer%22%0D%0A++++%5D%0D%0A%7D&allow=%7B%0D%0A++++%22roles%22%3A+%5B%0D%0A++++++++%22developer%22%0D%0A++++%5D%0D%0A%7D>`__, `deny demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22cleopaws%22%2C%0D%0A++++%22roles%22%3A+%5B%22dog%22%5D%0D%0A%7D&allow=%7B%0D%0A++++%22roles%22%3A+%5B%0D%0A++++++++%22developer%22%0D%0A++++%5D%0D%0A%7D>`__):
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow:
+          roles:
+          - developer
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": {
-            "roles": ["developer"]
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow:
+          roles:
+          - developer
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": {
+            "roles": [
+              "developer"
+            ]
+          }
         }
-    }
+.. [[[end]]]
 
 Note that "roles" is not a concept that is baked into Datasette - it's a convention that plugins can choose to implement and act on.
 
 If you want to provide access to any actor with a value for a specific key, use ``"*"``. For example, to match any logged-in user specify the following (`allow demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22simon%22%0D%0A%7D&allow=%7B%0D%0A++++%22id%22%3A+%22*%22%0D%0A%7D>`__, `deny demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22bot%22%3A+%22readme-bot%22%0D%0A%7D&allow=%7B%0D%0A++++%22id%22%3A+%22*%22%0D%0A%7D>`__):
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow:
+          id: "*"
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": {
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow:
+          id: "*"
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": {
             "id": "*"
+          }
         }
-    }
+.. [[[end]]]
 
-You can specify that only unauthenticated actors (from anynomous HTTP requests) should be allowed access using the special ``"unauthenticated": true`` key in an allow block (`allow demo <https://latest.datasette.io/-/allow-debug?actor=null&allow=%7B%0D%0A++++%22unauthenticated%22%3A+true%0D%0A%7D>`__, `deny demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22hello%22%0D%0A%7D&allow=%7B%0D%0A++++%22unauthenticated%22%3A+true%0D%0A%7D>`__):
+You can specify that only unauthenticated actors (from anonymous HTTP requests) should be allowed access using the special ``"unauthenticated": true`` key in an allow block (`allow demo <https://latest.datasette.io/-/allow-debug?actor=null&allow=%7B%0D%0A++++%22unauthenticated%22%3A+true%0D%0A%7D>`__, `deny demo <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22hello%22%0D%0A%7D&allow=%7B%0D%0A++++%22unauthenticated%22%3A+true%0D%0A%7D>`__):
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow:
+          unauthenticated: true
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": {
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow:
+          unauthenticated: true
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": {
             "unauthenticated": true
+          }
         }
-    }
+.. [[[end]]]
 
 Allow keys act as an "or" mechanism. An actor will be able to execute the query if any of their JSON properties match any of the values in the corresponding lists in the ``allow`` block. The following block will allow users with either a ``role`` of ``"ops"`` OR users who have an ``id`` of ``"simon"`` or ``"cleopaws"``:
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    import textwrap
+    config_example(cog, textwrap.dedent(
+      """
+        allow:
+          id:
+          - simon
+          - cleopaws
+          role: ops
+        """).strip(),
+        "YAML", "JSON"
+      )
+.. ]]]
 
-    {
-        "allow": {
-            "id": ["simon", "cleopaws"],
+.. tab:: YAML
+
+    .. code-block:: yaml
+
+        allow:
+          id:
+          - simon
+          - cleopaws
+          role: ops
+
+.. tab:: JSON
+
+    .. code-block:: json
+
+        {
+          "allow": {
+            "id": [
+              "simon",
+              "cleopaws"
+            ],
             "role": "ops"
+          }
         }
-    }
+.. [[[end]]]
 
 `Demo for cleopaws <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22cleopaws%22%0D%0A%7D&allow=%7B%0D%0A++++%22id%22%3A+%5B%0D%0A++++++++%22simon%22%2C%0D%0A++++++++%22cleopaws%22%0D%0A++++%5D%2C%0D%0A++++%22role%22%3A+%22ops%22%0D%0A%7D>`__, `demo for ops role <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22trevor%22%2C%0D%0A++++%22role%22%3A+%5B%0D%0A++++++++%22ops%22%2C%0D%0A++++++++%22staff%22%0D%0A++++%5D%0D%0A%7D&allow=%7B%0D%0A++++%22id%22%3A+%5B%0D%0A++++++++%22simon%22%2C%0D%0A++++++++%22cleopaws%22%0D%0A++++%5D%2C%0D%0A++++%22role%22%3A+%22ops%22%0D%0A%7D>`__, `demo for an actor matching neither rule <https://latest.datasette.io/-/allow-debug?actor=%7B%0D%0A++++%22id%22%3A+%22percy%22%2C%0D%0A++++%22role%22%3A+%5B%0D%0A++++++++%22staff%22%0D%0A++++%5D%0D%0A%7D&allow=%7B%0D%0A++++%22id%22%3A+%5B%0D%0A++++++++%22simon%22%2C%0D%0A++++++++%22cleopaws%22%0D%0A++++%5D%2C%0D%0A++++%22role%22%3A+%22ops%22%0D%0A%7D>`__.
 
@@ -183,90 +532,187 @@ The /-/allow-debug tool
 
 The ``/-/allow-debug`` tool lets you try out different  ``"action"`` blocks against different ``"actor"`` JSON objects. You can try that out here: https://latest.datasette.io/-/allow-debug
 
-.. _authentication_permissions_metadata:
+.. _authentication_permissions_config:
 
-Configuring permissions in metadata.json
+Access permissions in ``datasette.yaml``
 ========================================
 
-You can limit who is allowed to view different parts of your Datasette instance using ``"allow"`` keys in your :ref:`metadata` configuration.
+There are two ways to configure permissions using ``datasette.yaml`` (or ``datasette.json``).
+
+For simple visibility permissions you can use ``"allow"`` blocks in the root, database, table and query sections.
+
+For other permissions you can use a ``"permissions"`` block, described :ref:`in the next section <authentication_permissions_other>`.
+
+You can limit who is allowed to view different parts of your Datasette instance using ``"allow"`` keys in your :ref:`configuration`.
 
 You can control the following:
 
 * Access to the entire Datasette instance
 * Access to specific databases
 * Access to specific tables and views
-* Access to specific :ref:`canned_queries`
+* Access to specific :ref:`queries <queries>`
 
-If a user cannot access a specific database, they will not be able to access tables, views or queries within that database. If a user cannot access the instance they will not be able to access any of the databases, tables, views or queries.
+If a user has permission to view a table they will be able to view that table, independent of if they have permission to view the database or instance that the table exists within.
 
 .. _authentication_permissions_instance:
 
-Controlling access to an instance
----------------------------------
+Access to an instance
+---------------------
 
 Here's how to restrict access to your entire Datasette instance to just the ``"id": "root"`` user:
 
-.. code-block:: json
+.. [[[cog
+    from metadata_doc import config_example
+    config_example(cog, """
+        title: My private Datasette instance
+        allow:
+          id: root
+      """)
+.. ]]]
 
-    {
-        "title": "My private Datasette instance",
-        "allow": {
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            title: My private Datasette instance
+            allow:
+              id: root
+  
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "title": "My private Datasette instance",
+          "allow": {
             "id": "root"
+          }
         }
-    }
+.. [[[end]]]
 
 To deny access to all users, you can use ``"allow": false``:
 
-.. code-block:: json
+.. [[[cog
+    config_example(cog, """
+        title: My entirely inaccessible instance
+        allow: false
+    """)
+.. ]]]
 
-    {
-        "title": "My entirely inaccessible instance",
-        "allow": false
-    }
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            title: My entirely inaccessible instance
+            allow: false
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "title": "My entirely inaccessible instance",
+          "allow": false
+        }
+.. [[[end]]]
 
 One reason to do this is if you are using a Datasette plugin - such as `datasette-permissions-sql <https://github.com/simonw/datasette-permissions-sql>`__ - to control permissions instead.
 
 .. _authentication_permissions_database:
 
-Controlling access to specific databases
-----------------------------------------
+Access to specific databases
+----------------------------
 
 To limit access to a specific ``private.db`` database to just authenticated users, use the ``"allow"`` block like this:
 
-.. code-block:: json
+.. [[[cog
+    config_example(cog, """
+        databases:
+          private:
+            allow:
+              id: "*"
+    """)
+.. ]]]
 
-    {
-        "databases": {
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            databases:
+              private:
+                allow:
+                  id: "*"
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "databases": {
             "private": {
-                "allow": {
-                    "id": "*"
-                }
+              "allow": {
+                "id": "*"
+              }
             }
+          }
         }
-    }
+.. [[[end]]]
 
 .. _authentication_permissions_table:
 
-Controlling access to specific tables and views
------------------------------------------------
+Access to specific tables and views
+-----------------------------------
 
 To limit access to the ``users`` table in your ``bakery.db`` database:
 
-.. code-block:: json
+.. [[[cog
+    config_example(cog, """
+        databases:
+          bakery:
+            tables:
+              users:
+                allow:
+                  id: '*'
+    """)
+.. ]]]
 
-    {
-        "databases": {
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            databases:
+              bakery:
+                tables:
+                  users:
+                    allow:
+                      id: '*'
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "databases": {
             "bakery": {
-                "tables": {
-                    "users": {
-                        "allow": {
-                            "id": "*"
-                        }
-                    }
+              "tables": {
+                "users": {
+                  "allow": {
+                    "id": "*"
+                  }
                 }
+              }
             }
+          }
         }
-    }
+.. [[[end]]]
 
 This works for SQL views as well - you can list their names in the ``"tables"`` block above in the same way as regular tables.
 
@@ -277,70 +723,469 @@ This works for SQL views as well - you can list their names in the ``"tables"`` 
 
 .. _authentication_permissions_query:
 
-Controlling access to specific canned queries
----------------------------------------------
+Access to specific queries
+--------------------------
 
-:ref:`canned_queries` allow you to configure named SQL queries in your ``metadata.json`` that can be executed by users. These queries can be set up to both read and write to the database, so controlling who can execute them can be important.
+:ref:`Queries <queries>` allow you to configure named SQL queries in your ``datasette.yaml`` that can be executed by users. These queries can be set up to both read and write to the database, so controlling who can execute them can be important.
 
-To limit access to the ``add_name`` canned query in your ``dogs.db`` database to just the :ref:`root user<authentication_root>`:
+To limit access to the ``add_name`` query in your ``dogs.db`` database to just the :ref:`root user<authentication_root>`:
 
-.. code-block:: json
+.. [[[cog
+    config_example(cog, """
+        databases:
+          dogs:
+            queries:
+              add_name:
+                sql: INSERT INTO names (name) VALUES (:name)
+                write: true
+                allow:
+                  id:
+                  - root
+    """)
+.. ]]]
 
-    {
-        "databases": {
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            databases:
+              dogs:
+                queries:
+                  add_name:
+                    sql: INSERT INTO names (name) VALUES (:name)
+                    write: true
+                    allow:
+                      id:
+                      - root
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "databases": {
             "dogs": {
-                "queries": {
-                    "add_name": {
-                        "sql": "INSERT INTO names (name) VALUES (:name)",
-                        "write": true,
-                        "allow": {
-                            "id": ["root"]
-                        }
-                    }
+              "queries": {
+                "add_name": {
+                  "sql": "INSERT INTO names (name) VALUES (:name)",
+                  "write": true,
+                  "allow": {
+                    "id": [
+                      "root"
+                    ]
+                  }
                 }
+              }
             }
+          }
         }
-    }
+.. [[[end]]]
 
 .. _authentication_permissions_execute_sql:
 
 Controlling the ability to execute arbitrary SQL
 ------------------------------------------------
 
-The ``"allow_sql"`` block can be used to control who is allowed to execute arbitrary SQL queries, both using the form on the database page e.g. https://latest.datasette.io/fixtures or by appending a ``?_where=`` parameter to the table page as seen on https://latest.datasette.io/fixtures/facetable?_where=city_id=1.
+Datasette defaults to allowing any site visitor to execute their own custom SQL queries, for example using the form on `the database page <https://latest.datasette.io/fixtures>`__ or by appending a ``?_where=`` parameter to the table page `like this <https://latest.datasette.io/fixtures/facetable?_where=_city_id=1>`__.
+
+Access to this ability is controlled by the :ref:`actions_execute_sql` permission.
+
+This permission does not apply to structured table-browsing operations where Datasette constructs the SQL, such as sorting, column filters and :ref:`facets`. Faceting is controlled separately by the :ref:`setting_allow_facet` setting.
+
+The easiest way to disable arbitrary SQL queries is using the :ref:`default_allow_sql setting <setting_default_allow_sql>` when you first start Datasette running.
+
+You can alternatively use an ``"allow_sql"`` block to control who is allowed to execute arbitrary SQL queries.
+
+To prevent any user from executing arbitrary SQL queries, use this:
+
+.. [[[cog
+    config_example(cog, """
+        allow_sql: false
+    """)
+.. ]]]
+
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            allow_sql: false
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "allow_sql": false
+        }
+.. [[[end]]]
 
 To enable just the :ref:`root user<authentication_root>` to execute SQL for all databases in your instance, use the following:
 
-.. code-block:: json
+.. [[[cog
+    config_example(cog, """
+        allow_sql:
+          id: root
+    """)
+.. ]]]
 
-    {
-        "allow_sql": {
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            allow_sql:
+              id: root
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "allow_sql": {
             "id": "root"
+          }
         }
-    }
+.. [[[end]]]
 
 To limit this ability for just one specific database, use this:
 
+.. [[[cog
+    config_example(cog, """
+        databases:
+          mydatabase:
+            allow_sql:
+              id: root
+    """)
+.. ]]]
+
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            databases:
+              mydatabase:
+                allow_sql:
+                  id: root
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "databases": {
+            "mydatabase": {
+              "allow_sql": {
+                "id": "root"
+              }
+            }
+          }
+        }
+.. [[[end]]]
+
+.. _authentication_permissions_other:
+
+Other permissions in ``datasette.yaml``
+=======================================
+
+For all other permissions, you can use one or more ``"permissions"`` blocks in your ``datasette.yaml`` configuration file.
+
+To grant access to the :ref:`permissions debug tool <PermissionsDebugView>` to all signed in users, you can grant ``permissions-debug`` to any actor with an ``id`` matching the wildcard ``*`` by adding this a the root of your configuration:
+
+.. [[[cog
+    config_example(cog, """
+        permissions:
+          debug-menu:
+            id: '*'
+    """)
+.. ]]]
+
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            permissions:
+              debug-menu:
+                id: '*'
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "permissions": {
+            "debug-menu": {
+              "id": "*"
+            }
+          }
+        }
+.. [[[end]]]
+
+To grant ``create-table`` to the user with ``id`` of ``editor`` for the ``docs`` database:
+
+.. [[[cog
+    config_example(cog, """
+        databases:
+          docs:
+            permissions:
+              create-table:
+                id: editor
+    """)
+.. ]]]
+
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            databases:
+              docs:
+                permissions:
+                  create-table:
+                    id: editor
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "databases": {
+            "docs": {
+              "permissions": {
+                "create-table": {
+                  "id": "editor"
+                }
+              }
+            }
+          }
+        }
+.. [[[end]]]
+
+Other table-scoped write permissions, including ``set-column-type``, can be configured in the same place.
+
+And for ``insert-row`` against the ``reports`` table in that ``docs`` database:
+
+.. [[[cog
+    config_example(cog, """
+        databases:
+          docs:
+            tables:
+              reports:
+                permissions:
+                  insert-row:
+                    id: editor
+    """)
+.. ]]]
+
+.. tab:: datasette.yaml
+
+    .. code-block:: yaml
+
+
+            databases:
+              docs:
+                tables:
+                  reports:
+                    permissions:
+                      insert-row:
+                        id: editor
+
+
+.. tab:: datasette.json
+
+    .. code-block:: json
+
+        {
+          "databases": {
+            "docs": {
+              "tables": {
+                "reports": {
+                  "permissions": {
+                    "insert-row": {
+                      "id": "editor"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+.. [[[end]]]
+
+The :ref:`permissions debug tool <PermissionsDebugView>` can be useful for helping test permissions that you have configured in this way.
+
+.. _CreateTokenView:
+
+API Tokens
+==========
+
+Datasette includes a default mechanism for generating API tokens that can be used to authenticate requests.
+
+Authenticated users can create new API tokens using a form on the ``/-/create-token`` page.
+
+Tokens created in this way can be further restricted to only allow access to specific actions, or to limit those actions to specific databases, tables or queries.
+
+Created tokens can then be passed in the ``Authorization: Bearer $token`` header of HTTP requests to Datasette.
+
+A token created by a user will include that user's ``"id"`` in the token payload, so any permissions granted to that user based on their ID can be made available to the token as well.
+
+When one of these a token accompanies a request, the actor for that request will have the following shape:
+
 .. code-block:: json
 
     {
-        "databases": {
-            "mydatabase": {
-                "allow_sql": {
-                    "id": "root"
-                }
-            }
-        }
+        "id": "user_id",
+        "token": "dstok",
+        "token_expires": 1667717426
     }
+
+The ``"id"`` field duplicates the ID of the actor who first created the token.
+
+The ``"token"`` field identifies that this actor was authenticated using a Datasette signed token (``dstok``).
+
+The ``"token_expires"`` field, if present, indicates that the token will expire after that integer timestamp.
+
+The ``/-/create-token`` page cannot be accessed by actors that are authenticated with a ``"token": "some-value"`` property. This is to prevent API tokens from being used to create more tokens.
+
+Datasette plugins that implement their own form of API token authentication should follow this convention.
+
+If a request presents a token that a token handler recognizes but rejects - an invalid signature, a malformed payload or an expired token - Datasette responds with a ``401`` status, the :ref:`standard JSON error format <json_api_errors>` and a ``WWW-Authenticate: Bearer error="invalid_token"`` header. This means API clients can distinguish "your token needs to be renewed" (``401``) from "your token does not grant this permission" (``403``). A ``Bearer`` token that no registered handler recognizes at all is ignored, since it may be intended for an authentication plugin.
+
+You can disable the signed token feature entirely using the :ref:`allow_signed_tokens <setting_allow_signed_tokens>` setting. Requests presenting a ``dstok_`` token while the feature is disabled receive a ``401``.
+
+.. _authentication_cli_create_token:
+
+datasette create-token
+----------------------
+
+You can also create tokens on the command line using the ``datasette create-token`` command.
+
+This command takes one required argument - the ID of the actor to be associated with the created token.
+
+You can specify a ``-e/--expires-after`` option in seconds. If omitted, the token will never expire.
+
+The command will sign the token using the ``DATASETTE_SECRET`` environment variable, if available. You can also pass the secret using the ``--secret`` option.
+
+This means you can run the command locally to create tokens for use with a deployed Datasette instance, provided you know that instance's secret.
+
+To create a token for the ``root`` actor that will expire in one hour::
+
+    datasette create-token root --expires-after 3600
+
+To create a token that never expires using a specific secret::
+
+    datasette create-token root --secret my-secret-goes-here
+
+.. _authentication_cli_create_token_restrict:
+
+Restricting the actions that a token can perform
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Tokens created using ``datasette create-token ACTOR_ID`` will inherit all of the permissions of the actor that they are associated with.
+
+You can pass additional options to create tokens that are restricted to a subset of that actor's permissions.
+
+To restrict the token to just specific permissions against all available databases, use the ``--all`` option::
+
+    datasette create-token root --all insert-row --all update-row
+
+This option can be passed as many times as you like. In the above example the token will only be allowed to insert and update rows.
+
+You can also restrict permissions such that they can only be used within specific databases::
+
+    datasette create-token root --database mydatabase insert-row
+
+The resulting token will only be able to insert rows, and only to tables in the ``mydatabase`` database.
+
+Finally, you can restrict permissions to individual resources - tables, SQL views and :ref:`named queries <queries>` - within a specific database::
+
+    datasette create-token root --resource mydatabase mytable insert-row
+
+These options have short versions: ``-a`` for ``--all``, ``-d`` for ``--database`` and ``-r`` for ``--resource``.
+
+You can add ``--debug`` to see a JSON representation of the token that has been created. Here's a full example::
+
+    datasette create-token root \
+        --secret mysecret \
+        --all view-instance \
+        --all view-table \
+        --database docs view-query \
+        --resource docs documents insert-row \
+        --resource docs documents update-row \
+        --debug
+
+This example outputs the following::
+
+    dstok_.eJxFizEKgDAMRe_y5w4qYrFXERGxDkVsMI0uxbubdjFL8l_ez1jhwEQCA6Fjjxp90qtkuHawzdjYrh8MFobLxZ_wBH0_gtnAF-hpS5VfmF8D_lnd97lHqUJgLd6sls4H1qwlhA.nH_7RecYHj5qSzvjhMU95iy0Xlc
+
+    Decoded:
+
+    {
+      "a": "root",
+      "token": "dstok",
+      "t": 1670907246,
+      "_r": {
+        "a": [
+          "vi",
+          "vt"
+        ],
+        "d": {
+          "docs": [
+            "vq"
+          ]
+        },
+        "r": {
+          "docs": {
+            "documents": [
+              "ir",
+              "ur"
+            ]
+          }
+        }
+      }
+    }
+
+Restrictions act as an allowlist layered on top of the actor's existing
+permissions. They can only remove access the actor would otherwise have—they
+cannot grant new access. If the underlying actor is denied by ``allow`` rules in
+``datasette.yaml`` or by a plugin, a token that lists that resource in its
+``"_r"`` section will still be denied.
+
+To create tokens with restrictions in Python code, use the :ref:`TokenRestrictions <TokenRestrictions>` builder and pass it to :ref:`datasette.create_token() <datasette_create_token>`.
 
 .. _permissions_plugins:
 
 Checking permissions in plugins
 ===============================
 
-Datasette plugins can check if an actor has permission to perform an action using the :ref:`datasette.permission_allowed(...)<datasette_permission_allowed>` method.
+Datasette plugins can check if an actor has permission to perform an action using :ref:`datasette_allowed`—for example::
 
-Datasette core performs a number of permission checks, :ref:`documented below <permissions>`. Plugins can implement the :ref:`plugin_hook_permission_allowed` plugin hook to participate in decisions about whether an actor should be able to perform a specified action.
+    from datasette.resources import TableResource
+
+    can_edit = await datasette.allowed(
+        action="update-row",
+        resource=TableResource(database="fixtures", table="facetable"),
+        actor=request.actor,
+    )
+
+Use :ref:`datasette_ensure_permission` when you need to enforce a permission and
+raise a ``Forbidden`` error automatically.
+
+Plugins that define new operations should return :class:`~datasette.permissions.Action`
+objects from :ref:`plugin_register_actions` and can supply additional allow/deny
+rules by returning :class:`~datasette.permissions.PermissionSQL` objects from the
+:ref:`plugin_hook_permission_resources_sql` hook. Those rules are merged with
+configuration ``allow`` blocks and actor restrictions to determine the final
+result for each check.
 
 .. _authentication_actor_matches_allow:
 
@@ -360,14 +1205,76 @@ The currently authenticated actor is made available to plugins as ``request.acto
 
 .. _PermissionsDebugView:
 
-The permissions debug tool
-==========================
+Permissions debug tools
+=======================
 
-The debug tool at ``/-/permissions`` is only available to the :ref:`authenticated root user <authentication_root>` (or any actor granted the ``permissions-debug`` action according to a plugin).
+The debug tool at ``/-/permissions`` is available to any actor with the ``permissions-debug`` permission. By default this is just the :ref:`authenticated root user <authentication_root>` but you can open it up to all users by starting Datasette like this::
 
-It shows the thirty most recent permission checks that have been carried out by the Datasette instance.
+    datasette -s permissions.permissions-debug true data.db
 
-This is designed to help administrators and plugin authors understand exactly how permission checks are being carried out, in order to effectively configure Datasette's permission system.
+The permission debug tools answer four different questions:
+
+Why was this decision allowed or denied?
+    Use :ref:`PermissionCheckView`. It shows every matching rule, identifies the winning specificity level, applies actor restrictions and evaluates any required actions.
+
+Which resources can the current actor access?
+    Use :ref:`AllowedResourcesView` to view an access map for a selected action.
+
+Which raw rules did Datasette and its plugins contribute?
+    Use :ref:`PermissionRulesView` to inspect the rules before they are resolved into decisions.
+
+Which checks has this Datasette instance performed recently?
+    Use ``/-/permissions`` to view recent permission activity.
+
+These tools are designed to help administrators and plugin authors understand and confirm the effective permissions configuration.
+
+These debug endpoints are exempt from the :ref:`JSON API stability promise <json_api_stability>` - their JSON shapes may change in future releases.
+
+.. _AllowedResourcesView:
+
+Allowed resources view
+----------------------
+
+The ``/-/allowed`` endpoint displays resources that the current actor can access for a specified ``action``.
+
+This endpoint provides an interactive HTML form interface. Add ``.json`` to the URL path (e.g. ``/-/allowed.json``) to get the raw JSON response instead.
+
+Pass ``?action=view-table`` (or another action) to select the action. Optional ``parent=`` and ``child=`` query parameters can narrow the results to a specific database/table pair. Results are paginated: ``?_size=`` sets the page size (default 50, maximum 200, ``max`` for the maximum) and ``?_page=`` selects a page.
+
+This endpoint is publicly accessible to help users understand their own permissions. The potentially sensitive ``reason`` field is only shown to users with the ``permissions-debug`` permission - it shows the plugins and explanatory reasons that were responsible for each decision.
+
+.. _PermissionRulesView:
+
+Permission rules view
+---------------------
+
+The ``/-/rules`` endpoint displays all permission rules (both allow and deny) for each candidate resource for the requested action.
+
+This endpoint provides an interactive HTML form interface. Add ``.json`` to the URL path (e.g. ``/-/rules.json?action=view-table``) to get the raw JSON response instead.
+
+Pass ``?action=`` as a query parameter to specify which action to check. The ``?_size=`` and ``?_page=`` pagination parameters work the same as on ``/-/allowed``.
+
+This endpoint requires the ``permissions-debug`` permission.
+
+.. _PermissionCheckView:
+
+Permission check view
+---------------------
+
+The ``/-/check`` endpoint evaluates and explains a single actor, action and resource decision. The explanation includes:
+
+* Every matching allow and deny rule, with its source and reason.
+* The winning resource, parent or global scope.
+* Rules ignored because a more specific rule matched, or because a deny won at the same scope.
+* Actor restriction allowlists that included or excluded the resource.
+* Additional actions required by the requested action.
+* An explicit default-deny explanation when no rule matched.
+
+This endpoint provides an interactive HTML form interface. Add ``.json`` to the URL path (e.g. ``/-/check.json?action=view-instance``) to get the raw JSON response instead.
+
+Pass ``?action=`` to specify the action to check, and optional ``?parent=`` and ``?child=`` parameters to specify the resource. The interactive form also accepts actor JSON, allowing a hypothetical actor to be tested without signing in as that actor. The JSON endpoint accepts the same value using the ``actor`` query string parameter. Use ``actor=null`` to represent an anonymous actor.
+
+This endpoint requires the ``permissions-debug`` permission. The hypothetical actor is used only for the decision being explained; access to the debug tool is checked against the actor who is actually signed in.
 
 .. _authentication_ds_actor:
 
@@ -381,19 +1288,24 @@ Authentication plugins can set signed ``ds_actor`` cookies themselves like so:
 .. code-block:: python
 
     response = Response.redirect("/")
-    response.set_cookie("ds_actor", datasette.sign({
-        "a": {
-            "id": "cleopaws"
-        }
-    }, "actor"))
+    datasette.set_actor_cookie(response, {"id": "cleopaws"})
 
-Note that you need to pass ``"actor"`` as the namespace to :ref:`datasette_sign`.
+The shape of data encoded in the cookie is as follows:
 
-The shape of data encoded in the cookie is as follows::
+.. code-block:: json
 
     {
-        "a": {... actor ...}
+      "a": {
+        "id": "cleopaws"
+      }
     }
+
+To implement logout in a plugin, use the ``delete_actor_cookie()`` method:
+
+.. code-block:: python
+
+    response = Response.redirect("/")
+    datasette.delete_actor_cookie(response)
 
 .. _authentication_ds_actor_expiry:
 
@@ -402,34 +1314,25 @@ Including an expiry time
 
 ``ds_actor`` cookies can optionally include a signed expiry timestamp, after which the cookies will no longer be valid. Authentication plugins may chose to use this mechanism to limit the lifetime of the cookie. For example, if a plugin implements single-sign-on against another source it may decide to set short-lived cookies so that if the user is removed from the SSO system their existing Datasette cookies will stop working shortly afterwards.
 
-To include an expiry, add a ``"e"`` key to the cookie value containing a `base62-encoded integer <https://pypi.org/project/python-baseconv/>`__ representing the timestamp when the cookie should expire. For example, here's how to set a cookie that expires after 24 hours:
+To include an expiry pass ``expire_after=`` to ``datasette.set_actor_cookie()`` with a number of seconds. For example, to expire in 24 hours:
 
 .. code-block:: python
 
-    import time
-    import baseconv
-
-    expires_at = int(time.time()) + (24 * 60 * 60)
-
     response = Response.redirect("/")
-    response.set_cookie("ds_actor", datasette.sign({
-        "a": {
-            "id": "cleopaws"
-        },
-        "e": baseconv.base62.encode(expires_at),
-    }, "actor"))
+    datasette.set_actor_cookie(
+        response, {"id": "cleopaws"}, expire_after=60 * 60 * 24
+    )
 
 The resulting cookie will encode data that looks something like this:
 
 .. code-block:: json
 
     {
-        "a": {
-            "id": "cleopaws"
-        },
-        "e": "1jjSji"
+      "a": {
+        "id": "cleopaws"
+      },
+      "e": "1jjSji"
     }
-
 
 .. _LogoutView:
 
@@ -438,96 +1341,242 @@ The /-/logout page
 
 The page at ``/-/logout`` provides the ability to log out of a ``ds_actor`` cookie authentication session.
 
-.. _permissions:
+.. _actions:
 
-Built-in permissions
-====================
+Built-in actions
+================
 
 This section lists all of the permission checks that are carried out by Datasette core, along with the ``resource`` if it was passed.
 
-.. _permissions_view_instance:
+.. _actions_view_instance:
 
 view-instance
 -------------
 
 Top level permission - Actor is allowed to view any pages within this instance, starting at https://latest.datasette.io/
 
-Default *allow*.
-
-.. _permissions_view_database:
+.. _actions_view_database:
 
 view-database
 -------------
 
 Actor is allowed to view a database page, e.g. https://latest.datasette.io/fixtures
 
-``resource`` - string
-    The name of the database
+``resource`` - ``datasette.permissions.DatabaseResource(database)``
+    ``database`` is the name of the database (string)
 
-Default *allow*.
-
-.. _permissions_view_database_download:
+.. _actions_view_database_download:
 
 view-database-download
------------------------
+----------------------
 
 Actor is allowed to download a database, e.g. https://latest.datasette.io/fixtures.db
 
-``resource`` - string
-    The name of the database
+``resource`` - ``datasette.resources.DatabaseResource(database)``
+    ``database`` is the name of the database (string)
 
-Default *allow*.
-
-.. _permissions_view_table:
+.. _actions_view_table:
 
 view-table
 ----------
 
 Actor is allowed to view a table (or view) page, e.g. https://latest.datasette.io/fixtures/complex_foreign_keys
 
-``resource`` - tuple: (string, string)
-    The name of the database, then the name of the table
+Derived implementation tables require access to their immediate source: FTS and RTree shadow tables require access to their virtual table, external-content FTS tables require access to their content table, and FTS vocabulary tables (``fts5vocab`` and ``fts4aux``) require access to their FTS table. The derived table's own permission rules also apply.
 
-Default *allow*.
+Access is always denied if the source table is itself derived, or if a vocabulary table's source cannot be identified.
 
-.. _permissions_view_query:
+The same rules apply to individual permission checks and table listings, including whether they are private. If a database error prevents dependency discovery, the check or listing fails with an error instead of ignoring the dependencies. Failed discovery results are not cached, so later checks can retry.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the table (string)
+
+.. _actions_view_query:
 
 view-query
 ----------
 
-Actor is allowed to view (and execute) a :ref:`canned query <canned_queries>` page, e.g. https://latest.datasette.io/fixtures/pragma_cache_size - this includes executing :ref:`canned_queries_writable`.
+Actor is allowed to view a stored query page, e.g. https://latest.datasette.io/fixtures/pragma_cache_size. Executing an untrusted stored query also requires ``execute-sql`` or the relevant write permissions; :ref:`trusted stored queries <trusted_stored_queries>` can execute with ``view-query`` alone.
 
-``resource`` - tuple: (string, string)
-    The name of the database, then the name of the canned query
+``resource`` - ``datasette.resources.QueryResource(database, query)``
+    ``database`` is the name of the database (string)
 
-Default *allow*.
+    ``query`` is the name of the query (string)
 
-.. _permissions_execute_sql:
+.. _actions_store_query:
+
+store-query
+-----------
+
+Actor is allowed to create stored queries against a database.
+
+``resource`` - ``datasette.resources.DatabaseResource(database)``
+    ``database`` is the name of the database (string)
+
+.. _actions_update_query:
+
+update-query
+------------
+
+Actor is allowed to update a stored query.
+
+``resource`` - ``datasette.resources.QueryResource(database, query)``
+    ``database`` is the name of the database (string)
+
+    ``query`` is the name of the query (string)
+
+.. _actions_delete_query:
+
+delete-query
+------------
+
+Actor is allowed to delete a stored query.
+
+``resource`` - ``datasette.resources.QueryResource(database, query)``
+    ``database`` is the name of the database (string)
+
+    ``query`` is the name of the query (string)
+
+.. _actions_insert_row:
+
+insert-row
+----------
+
+Actor is allowed to insert rows into a table.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the table (string)
+
+.. _actions_delete_row:
+
+delete-row
+----------
+
+Actor is allowed to delete rows from a table.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the table (string)
+
+.. _actions_update_row:
+
+update-row
+----------
+
+Actor is allowed to update rows in a table.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the table (string)
+
+.. _actions_create_table:
+
+create-table
+------------
+
+Actor is allowed to create a database table.
+
+``resource`` - ``datasette.resources.DatabaseResource(database)``
+    ``database`` is the name of the database (string)
+
+.. _actions_create_view:
+
+create-view
+-----------
+
+Actor is allowed to create a database view.
+
+``resource`` - ``datasette.resources.DatabaseResource(database)``
+    ``database`` is the name of the database (string)
+
+.. _actions_alter_table:
+
+alter-table
+-----------
+
+Actor is allowed to alter a database table.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the table (string)
+
+.. _actions_set_column_type:
+
+set-column-type
+---------------
+
+Actor is allowed to set assigned :ref:`column types <table_configuration_column_types>` for columns in a table.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the table (string)
+
+.. _actions_drop_table:
+
+drop-table
+----------
+
+Actor is allowed to drop a database table.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the table (string)
+
+.. _actions_drop_view:
+
+drop-view
+---------
+
+Actor is allowed to drop a database view.
+
+``resource`` - ``datasette.resources.TableResource(database, table)``
+    ``database`` is the name of the database (string)
+
+    ``table`` is the name of the view (string)
+
+.. _actions_execute_sql:
 
 execute-sql
 -----------
 
-Actor is allowed to run arbitrary SQL queries against a specific database, e.g. https://latest.datasette.io/fixtures?sql=select+100
+Actor is allowed to run arbitrary read-only SQL queries against a specific database using the :ref:`custom SQL query page <pages_custom_sql_queries>`, e.g. https://latest.datasette.io/fixtures/-/query?sql=select+100
 
-``resource`` - string
-    The name of the database
+This action also controls raw SQL supplied using ``?_where=``. It does not control structured table-browsing features such as :ref:`facets`, which use SQL generated by Datasette and are controlled by :ref:`setting_allow_facet`.
 
-Default *allow*.
+``resource`` - ``datasette.resources.DatabaseResource(database)``
+    ``database`` is the name of the database (string)
 
-.. _permissions_permissions_debug:
+See also :ref:`the default_allow_sql setting <setting_default_allow_sql>`.
+
+.. _actions_execute_write_sql:
+
+execute-write-sql
+-----------------
+
+Actor is allowed to run arbitrary writable SQL queries against a specific database using the :ref:`write SQL queries page <pages_execute_write>`, subject to table-level write permissions such as ``insert-row``, ``update-row`` and ``delete-row``. SQL functions are allowed and are not separately restricted by Datasette permissions.
+
+``resource`` - ``datasette.resources.DatabaseResource(database)``
+    ``database`` is the name of the database (string)
+
+.. _actions_permissions_debug:
 
 permissions-debug
 -----------------
 
-Actor is allowed to view the ``/-/permissions`` debug page.
+Actor is allowed to view the ``/-/permissions`` debug tools.
 
-Default *deny*.
-
-.. _permissions_debug_menu:
+.. _actions_debug_menu:
 
 debug-menu
 ----------
 
-Controls if the various debug pages are displayed in the navigation menu.
-
-Default *deny*.
+Controls if the various debug pages are displayed in the jump menu.

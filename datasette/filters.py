@@ -1,7 +1,194 @@
 import json
-import numbers
+import math
+from typing import ClassVar
 
-from .utils import detect_json1, escape_sqlite
+from datasette import hookimpl
+from datasette.resources import DatabaseResource, TableResource
+from datasette.utils.asgi import BadRequest
+from datasette.views.base import DatasetteError
+
+from .utils import detect_json1, escape_sqlite, path_with_removed_args
+
+
+@hookimpl(specname="filters_from_request")
+def where_filters(request, database, datasette):
+    # This one deals with ?_where=
+    async def inner():
+        where_clauses = []
+        extra_wheres_for_ui = []
+        if "_where" in request.args:
+            if not await datasette.allowed(
+                action="execute-sql",
+                resource=DatabaseResource(database=database),
+                actor=request.actor,
+            ):
+                raise DatasetteError("_where= is not allowed", status=403)
+            else:
+                where_clauses.extend(request.args.getlist("_where"))
+                extra_wheres_for_ui = [
+                    {
+                        "text": text,
+                        "remove_url": path_with_removed_args(request, {"_where": text}),
+                    }
+                    for text in request.args.getlist("_where")
+                ]
+
+        return FilterArguments(
+            where_clauses,
+            extra_context={
+                "extra_wheres_for_ui": extra_wheres_for_ui,
+            },
+        )
+
+    return inner
+
+
+@hookimpl(specname="filters_from_request")
+def search_filters(request, database, table, datasette):
+    # ?_search= and _search_colname=
+    async def inner():
+        where_clauses = []
+        params = {}
+        human_descriptions = []
+        extra_context = {}
+
+        # Figure out which trusted fts_table to use. Query string parameters can
+        # repeat this mapping (for backwards compatibility), but must not select
+        # a different table or primary key.
+        table_metadata = await datasette.table_config(database, table)
+        db = datasette.get_database(database)
+        fts_table = table_metadata.get("fts_table")
+        fts_table = fts_table or await db.fts_table(table)
+        fts_pk = table_metadata.get("fts_pk", "rowid")
+        requested_fts_table = request.args.get("_fts_table")
+        requested_fts_pk = request.args.get("_fts_pk")
+        if (requested_fts_table and requested_fts_table != fts_table) or (
+            requested_fts_pk and requested_fts_pk != fts_pk
+        ):
+            raise BadRequest("Invalid _fts_table or _fts_pk")
+        search_args = {
+            key: request.args[key]
+            for key in request.args
+            if key.startswith("_search") and key != "_searchmode"
+        }
+        search = ""
+        search_mode_raw = table_metadata.get("searchmode") == "raw"
+        # Or set search mode from the querystring
+        qs_searchmode = request.args.get("_searchmode")
+        if qs_searchmode == "escaped":
+            search_mode_raw = False
+        if qs_searchmode == "raw":
+            search_mode_raw = True
+
+        extra_context["supports_search"] = bool(fts_table)
+
+        if fts_table and search_args:
+            await datasette.ensure_permission(
+                action="view-table",
+                resource=TableResource(database=database, table=fts_table),
+                actor=request.actor,
+            )
+            if "_search" in search_args:
+                # Simple ?_search=xxx
+                search = search_args["_search"]
+                where_clauses.append(
+                    "{fts_pk} in (select rowid from {fts_table} where {fts_table} match {match_clause})".format(
+                        fts_table=escape_sqlite(fts_table),
+                        fts_pk=escape_sqlite(fts_pk),
+                        match_clause=(
+                            ":search" if search_mode_raw else "escape_fts(:search)"
+                        ),
+                    )
+                )
+                human_descriptions.append(f'search matches "{search}"')
+                params["search"] = search
+                extra_context["search"] = search
+            else:
+                # More complex: search against specific columns
+                for i, (key, search_text) in enumerate(search_args.items()):
+                    search_col = key.split("_search_", 1)[1]
+                    if search_col not in await db.table_columns(fts_table):
+                        raise BadRequest("Cannot search by that column")
+
+                    where_clauses.append(
+                        "rowid in (select rowid from {fts_table} where {search_col} match {match_clause})".format(
+                            fts_table=escape_sqlite(fts_table),
+                            search_col=escape_sqlite(search_col),
+                            match_clause=(
+                                f":search_{i}"
+                                if search_mode_raw
+                                else f"escape_fts(:search_{i})"
+                            ),
+                        )
+                    )
+                    human_descriptions.append(
+                        f'search column "{search_col}" matches "{search_text}"'
+                    )
+                    params[f"search_{i}"] = search_text
+                    extra_context["search"] = search_text
+
+        return FilterArguments(where_clauses, params, human_descriptions, extra_context)
+
+    return inner
+
+
+@hookimpl(specname="filters_from_request")
+def through_filters(request, database, table, datasette):
+    # ?_search= and _search_colname=
+    async def inner():
+        where_clauses = []
+        params = {}
+        human_descriptions = []
+        extra_context = {}
+
+        # Support for ?_through={table, column, value}
+        if "_through" in request.args:
+            for through in request.args.getlist("_through"):
+                through_data = json.loads(through)
+                through_table = through_data["table"]
+                other_column = through_data["column"]
+                value = through_data["value"]
+                await datasette.ensure_permission(
+                    action="view-table",
+                    resource=TableResource(database=database, table=through_table),
+                    actor=request.actor,
+                )
+                db = datasette.get_database(database)
+                outgoing_foreign_keys = await db.foreign_keys_for_table(through_table)
+                fk_to_us = next(
+                    (fk for fk in outgoing_foreign_keys if fk["other_table"] == table),
+                    None,
+                )
+                if fk_to_us is None:
+                    raise DatasetteError(
+                        "Invalid _through - could not find corresponding foreign key"
+                    )
+                param = f"p{len(params)}"
+                where_clauses.append(
+                    "{our_pk} in (select {our_column} from {through_table} where {other_column} = :{param})".format(
+                        through_table=escape_sqlite(through_table),
+                        our_pk=escape_sqlite(fk_to_us["other_column"]),
+                        our_column=escape_sqlite(fk_to_us["column"]),
+                        other_column=escape_sqlite(other_column),
+                        param=param,
+                    )
+                )
+                params[param] = value
+                human_descriptions.append(f'{through_table}.{other_column} = "{value}"')
+
+        return FilterArguments(where_clauses, params, human_descriptions, extra_context)
+
+    return inner
+
+
+class FilterArguments:
+    def __init__(
+        self, where_clauses, params=None, human_descriptions=None, extra_context=None
+    ):
+        self.where_clauses = where_clauses
+        self.params = params or {}
+        self.human_descriptions = human_descriptions or []
+        self.extra_context = extra_context or {}
 
 
 class Filter:
@@ -14,6 +201,17 @@ class Filter:
 
     def human_clause(self, column, value):
         raise NotImplementedError
+
+
+def _coerce_numeric_filter_value(value):
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            converted = float(value)
+        except ValueError:
+            return value
+        return converted if math.isfinite(converted) else value
 
 
 class TemplatedFilter(Filter):
@@ -37,13 +235,17 @@ class TemplatedFilter(Filter):
 
     def where_clause(self, table, column, value, param_counter):
         converted = self.format.format(value)
-        if self.numeric and converted.isdigit():
-            converted = int(converted)
+        if self.numeric:
+            converted = _coerce_numeric_filter_value(converted)
         if self.no_argument:
-            kwargs = {"c": column}
+            kwargs = {"c": _quote_sqlite_identifier(column)}
             converted = None
         else:
-            kwargs = {"c": column, "p": f"p{param_counter}", "t": table}
+            kwargs = {
+                "c": _quote_sqlite_identifier(column),
+                "p": f"p{param_counter}",
+                "t": _quote_sqlite_identifier(table),
+            }
         return self.sql_template.format(**kwargs), converted
 
     def human_clause(self, column, value):
@@ -55,6 +257,14 @@ class TemplatedFilter(Filter):
             return template.format(c=column)
         else:
             return template.format(c=column, v=value)
+
+
+def _quote_sqlite_identifier(identifier):
+    # Preserve the historic always-quoted SQL generated by TemplatedFilter.
+    escaped = escape_sqlite(identifier)
+    if escaped == identifier:
+        return f'"{identifier}"'
+    return escaped
 
 
 class InFilter(Filter):
@@ -98,49 +308,56 @@ class Filters:
             TemplatedFilter(
                 "exact",
                 "=",
-                '"{c}" = :{p}',
+                "{c} = :{p}",
                 lambda c, v: "{c} = {v}" if v.isdigit() else '{c} = "{v}"',
             ),
             TemplatedFilter(
                 "not",
                 "!=",
-                '"{c}" != :{p}',
+                "{c} != :{p}",
                 lambda c, v: "{c} != {v}" if v.isdigit() else '{c} != "{v}"',
             ),
             TemplatedFilter(
                 "contains",
                 "contains",
-                '"{c}" like :{p}',
+                "{c} like :{p}",
                 '{c} contains "{v}"',
+                format="%{}%",
+            ),
+            TemplatedFilter(
+                "notcontains",
+                "does not contain",
+                "{c} not like :{p}",
+                '{c} does not contain "{v}"',
                 format="%{}%",
             ),
             TemplatedFilter(
                 "endswith",
                 "ends with",
-                '"{c}" like :{p}',
+                "{c} like :{p}",
                 '{c} ends with "{v}"',
                 format="%{}",
             ),
             TemplatedFilter(
                 "startswith",
                 "starts with",
-                '"{c}" like :{p}',
+                "{c} like :{p}",
                 '{c} starts with "{v}"',
                 format="{}%",
             ),
-            TemplatedFilter("gt", ">", '"{c}" > :{p}', "{c} > {v}", numeric=True),
+            TemplatedFilter("gt", ">", "{c} > :{p}", "{c} > {v}", numeric=True),
             TemplatedFilter(
-                "gte", "\u2265", '"{c}" >= :{p}', "{c} \u2265 {v}", numeric=True
+                "gte", "\u2265", "{c} >= :{p}", "{c} \u2265 {v}", numeric=True
             ),
-            TemplatedFilter("lt", "<", '"{c}" < :{p}', "{c} < {v}", numeric=True),
+            TemplatedFilter("lt", "<", "{c} < :{p}", "{c} < {v}", numeric=True),
             TemplatedFilter(
-                "lte", "\u2264", '"{c}" <= :{p}', "{c} \u2264 {v}", numeric=True
+                "lte", "\u2264", "{c} <= :{p}", "{c} \u2264 {v}", numeric=True
             ),
-            TemplatedFilter("like", "like", '"{c}" like :{p}', '{c} like "{v}"'),
+            TemplatedFilter("like", "like", "{c} like :{p}", '{c} like "{v}"'),
             TemplatedFilter(
-                "notlike", "not like", '"{c}" not like :{p}', '{c} not like "{v}"'
+                "notlike", "not like", "{c} not like :{p}", '{c} not like "{v}"'
             ),
-            TemplatedFilter("glob", "glob", '"{c}" glob :{p}', '{c} glob "{v}"'),
+            TemplatedFilter("glob", "glob", "{c} glob :{p}", '{c} glob "{v}"'),
             InFilter(),
             NotInFilter(),
         ]
@@ -149,19 +366,13 @@ class Filters:
                 TemplatedFilter(
                     "arraycontains",
                     "array contains",
-                    """rowid in (
-            select {t}.rowid from {t}, json_each([{t}].[{c}]) j
-            where j.value = :{p}
-        )""",
+                    """:{p} in (select value from json_each({t}.{c}))""",
                     '{c} contains "{v}"',
                 ),
                 TemplatedFilter(
                     "arraynotcontains",
                     "array does not contain",
-                    """rowid not in (
-            select {t}.rowid from {t}, json_each([{t}].[{c}]) j
-            where j.value = :{p}
-        )""",
+                    """:{p} not in (select value from json_each({t}.{c}))""",
                     '{c} does not contain "{v}"',
                 ),
             ]
@@ -169,43 +380,37 @@ class Filters:
             else []
         )
         + [
+            TemplatedFilter("date", "date", "date({c}) = :{p}", '"{c}" is on date {v}'),
             TemplatedFilter(
-                "date", "date", 'date("{c}") = :{p}', '"{c}" is on date {v}'
-            ),
-            TemplatedFilter(
-                "isnull", "is null", '"{c}" is null', "{c} is null", no_argument=True
+                "isnull", "is null", "{c} is null", "{c} is null", no_argument=True
             ),
             TemplatedFilter(
                 "notnull",
                 "is not null",
-                '"{c}" is not null',
+                "{c} is not null",
                 "{c} is not null",
                 no_argument=True,
             ),
             TemplatedFilter(
                 "isblank",
                 "is blank",
-                '("{c}" is null or "{c}" = "")',
+                "({c} is null or {c} = '')",
                 "{c} is blank",
                 no_argument=True,
             ),
             TemplatedFilter(
                 "notblank",
                 "is not blank",
-                '("{c}" is not null and "{c}" != "")',
+                "({c} is not null and {c} != '')",
                 "{c} is not blank",
                 no_argument=True,
             ),
         ]
     )
-    _filters_by_key = {f.key: f for f in _filters}
+    _filters_by_key: ClassVar[dict[str, Filter]] = {f.key: f for f in _filters}
 
-    def __init__(self, pairs, units=None, ureg=None):
-        if units is None:
-            units = {}
+    def __init__(self, pairs):
         self.pairs = pairs
-        self.units = units
-        self.ureg = ureg
 
     def lookups(self):
         """Yields (lookup, display, no_argument) pairs"""
@@ -245,20 +450,6 @@ class Filters:
     def has_selections(self):
         return bool(self.pairs)
 
-    def convert_unit(self, column, value):
-        """If the user has provided a unit in the query, convert it into the column unit, if present."""
-        if column not in self.units:
-            return value
-
-        # Try to interpret the value as a unit
-        value = self.ureg(value)
-        if isinstance(value, numbers.Number):
-            # It's just a bare number, assume it's the column unit
-            return value
-
-        column_unit = self.ureg(self.units[column])
-        return value.to(column_unit).magnitude
-
     def build_where_clauses(self, table):
         sql_bits = []
         params = {}
@@ -266,9 +457,7 @@ class Filters:
         for column, lookup, value in self.selections():
             filter = self._filters_by_key.get(lookup, None)
             if filter:
-                sql_bit, param = filter.where_clause(
-                    table, column, self.convert_unit(column, value), i
-                )
+                sql_bit, param = filter.where_clause(table, column, value, i)
                 sql_bits.append(sql_bit)
                 if param is not None:
                     if not isinstance(param, list):

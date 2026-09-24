@@ -1,13 +1,30 @@
+import asyncio
 import json
-from datasette.utils import MultiParams
-from mimetypes import guess_type
-from urllib.parse import parse_qs, urlunparse, parse_qsl
-from pathlib import Path
-from html import escape
-from http.cookies import SimpleCookie, Morsel
 import re
+from http.cookies import Morsel, SimpleCookie
+from mimetypes import guess_type
+from pathlib import Path
+from urllib.parse import parse_qs, parse_qsl, urlunparse
+
 import aiofiles
 import aiofiles.os
+
+from datasette.utils import MultiParams, calculate_etag, error_body, sha256_file
+from datasette.utils.multipart import (
+    DEFAULT_MAX_FIELD_SIZE,
+    DEFAULT_MAX_FIELDS,
+    DEFAULT_MAX_FILE_SIZE,
+    DEFAULT_MAX_FILES,
+    DEFAULT_MAX_MEMORY_FILE_SIZE,
+    DEFAULT_MAX_PART_HEADER_BYTES,
+    DEFAULT_MAX_PART_HEADER_LINES,
+    DEFAULT_MAX_PARTS,
+    DEFAULT_MAX_REQUEST_SIZE,
+    DEFAULT_MIN_FREE_DISK_BYTES,
+    FormData,
+    MultipartParseError,
+    parse_form_data,
+)
 
 # Workaround for adding samesite support to pre 3.8 python
 Morsel._reserved["samesite"] = "SameSite"
@@ -23,6 +40,27 @@ class NotFound(Base400):
     status = 404
 
 
+class DatabaseNotFound(NotFound):
+    def __init__(self, database_name):
+        self.database_name = database_name
+        super().__init__("Database not found")
+
+
+class TableNotFound(NotFound):
+    def __init__(self, database_name, table):
+        super().__init__("Table not found")
+        self.database_name = database_name
+        self.table = table
+
+
+class RowNotFound(NotFound):
+    def __init__(self, database_name, table, pk_values):
+        super().__init__("Row not found")
+        self.database_name = database_name
+        self.table_name = table
+        self.pk_values = pk_values
+
+
 class Forbidden(Base400):
     status = 403
 
@@ -31,13 +69,41 @@ class BadRequest(Base400):
     status = 400
 
 
+class PayloadTooLarge(Base400):
+    status = 413
+
+
 SAMESITE_VALUES = ("strict", "lax", "none")
+
+# Bodies read fully into memory (post_body/post_vars/json) are capped at this
+# size unless the max_post_body_bytes setting says otherwise. Kept deliberately
+# far below multipart's DEFAULT_MAX_REQUEST_SIZE: that parser streams to disk,
+# while these bodies are held in RAM and json.loads() can multiply their
+# footprint several times over.
+DEFAULT_MAX_POST_BODY_BYTES = 2 * 1024 * 1024  # 2MB
+
+
+class _RequestHeaders(dict):
+    """Incoming headers with lowercase keys and case-insensitive lookups."""
+
+    def __getitem__(self, key):
+        return super().__getitem__(key.lower())
+
+    def get(self, key, default=None):
+        return super().get(key.lower(), default)
+
+    def __contains__(self, key):
+        return super().__contains__(key.lower())
 
 
 class Request:
-    def __init__(self, scope, receive):
+    def __init__(self, scope, receive, max_post_body_bytes=DEFAULT_MAX_POST_BODY_BYTES):
         self.scope = scope
         self.receive = receive
+        self.max_post_body_bytes = max_post_body_bytes
+
+    def __repr__(self):
+        return f'<asgi.Request method="{self.method}" url="{self.url}">'
 
     @property
     def method(self):
@@ -59,10 +125,10 @@ class Request:
 
     @property
     def headers(self):
-        return {
-            k.decode("latin-1").lower(): v.decode("latin-1")
+        return _RequestHeaders(
+            (k.decode("latin-1").lower(), v.decode("latin-1"))
             for k, v in self.scope.get("headers") or []
-        }
+        )
 
     @property
     def host(self):
@@ -77,7 +143,7 @@ class Request:
     @property
     def path(self):
         if self.scope.get("raw_path") is not None:
-            return self.scope["raw_path"].decode("latin-1")
+            return self.scope["raw_path"].decode("latin-1").partition("?")[0]
         else:
             path = self.scope["path"]
             if isinstance(path, str):
@@ -96,39 +162,138 @@ class Request:
 
     @property
     def args(self):
-        return MultiParams(parse_qs(qs=self.query_string))
+        return MultiParams(parse_qs(qs=self.query_string, keep_blank_values=True))
 
     @property
     def actor(self):
         return self.scope.get("actor", None)
 
-    async def post_body(self):
-        body = b""
+    async def post_body(self, max_bytes=None):
+        """
+        Read the request body fully into memory.
+
+        The body is capped at max_bytes - or self.max_post_body_bytes
+        (default 2MB, set from the max_post_body_bytes setting for requests
+        created by Datasette) if max_bytes is not provided. Pass max_bytes=0
+        to disable the limit. Raises PayloadTooLarge (HTTP 413) if exceeded -
+        oversized bodies are rejected as soon as the limit is passed, without
+        buffering the rest.
+        """
+        if max_bytes is None:
+            max_bytes = self.max_post_body_bytes
+        too_large = PayloadTooLarge(
+            f"Request body exceeded maximum size of {max_bytes} bytes"
+        )
+        if max_bytes:
+            # Reject early if the client declares an oversized body
+            try:
+                if int(self.headers.get("content-length", "")) > max_bytes:
+                    raise too_large
+            except ValueError:
+                # Missing or malformed - the streaming check below still applies
+                pass
+        chunks = []
+        received = 0
         more_body = True
         while more_body:
             message = await self.receive()
             assert message["type"] == "http.request", message
-            body += message.get("body", b"")
+            chunk = message.get("body", b"")
+            received += len(chunk)
+            if max_bytes and received > max_bytes:
+                raise too_large
+            chunks.append(chunk)
             more_body = message.get("more_body", False)
-        return body
+        return b"".join(chunks)
 
     async def post_vars(self):
         body = await self.post_body()
         return dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
 
+    async def json(self):
+        body = await self.post_body()
+        return json.loads(body)
+
+    async def form(
+        self,
+        files: bool = False,
+        max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+        max_request_size: int = DEFAULT_MAX_REQUEST_SIZE,
+        max_fields: int = DEFAULT_MAX_FIELDS,
+        max_files: int = DEFAULT_MAX_FILES,
+        max_parts: int | None = DEFAULT_MAX_PARTS,
+        max_field_size: int = DEFAULT_MAX_FIELD_SIZE,
+        max_memory_file_size: int = DEFAULT_MAX_MEMORY_FILE_SIZE,
+        max_part_header_bytes: int = DEFAULT_MAX_PART_HEADER_BYTES,
+        max_part_header_lines: int = DEFAULT_MAX_PART_HEADER_LINES,
+        min_free_disk_bytes: int = DEFAULT_MIN_FREE_DISK_BYTES,
+    ) -> FormData:
+        """
+        Parse form data from the request body.
+
+        Supports both application/x-www-form-urlencoded and multipart/form-data.
+
+        Args:
+            files: If True, store file uploads; if False (default), discard them
+            max_file_size: Maximum size per file in bytes (default 50MB)
+            max_request_size: Maximum total request size in bytes (default 100MB)
+            max_fields: Maximum number of form fields (default 1000)
+            max_files: Maximum number of file uploads (default 100)
+            max_parts: Maximum number of multipart parts (default max_fields + max_files)
+            max_field_size: Maximum size of a text field value in bytes (default 100KB)
+            max_memory_file_size: Threshold before files spill to disk (default 1MB)
+            max_part_header_bytes: Maximum bytes allowed in part headers (default 16KB)
+            max_part_header_lines: Maximum header lines per part (default 100)
+            min_free_disk_bytes: Minimum free bytes required in temp dir (default 50MB)
+
+        Returns:
+            FormData object with dict-like access to fields and files.
+            Use form["key"] for first value, form.getlist("key") for all values.
+
+        Raises:
+            BadRequest: If content-type is missing, unsupported, or parsing fails
+        """
+        content_type = self.headers.get("content-type", "")
+        if not content_type:
+            raise BadRequest(
+                "Missing Content-Type header; expected application/x-www-form-urlencoded "
+                "or multipart/form-data"
+            )
+
+        try:
+            return await parse_form_data(
+                receive=self.receive,
+                content_type=content_type,
+                files=files,
+                max_file_size=max_file_size,
+                max_request_size=max_request_size,
+                max_fields=max_fields,
+                max_files=max_files,
+                max_parts=max_parts,
+                max_field_size=max_field_size,
+                max_memory_file_size=max_memory_file_size,
+                max_part_header_bytes=max_part_header_bytes,
+                max_part_header_lines=max_part_header_lines,
+                min_free_disk_bytes=min_free_disk_bytes,
+            )
+        except MultipartParseError as e:
+            raise BadRequest(str(e))
+
     @classmethod
-    def fake(cls, path_with_query_string, method="GET", scheme="http"):
+    def fake(cls, path_with_query_string, method="GET", scheme="http", url_vars=None):
         """Useful for constructing Request objects for tests"""
         path, _, query_string = path_with_query_string.partition("?")
         scope = {
             "http_version": "1.1",
             "method": method,
             "path": path,
-            "raw_path": path.encode("latin-1"),
+            "raw_path": path_with_query_string.encode("latin-1"),
             "query_string": query_string.encode("latin-1"),
             "scheme": scheme,
             "type": "http",
         }
+        if url_vars:
+            scope["url_route"] = {"kwargs": url_vars}
         return cls(scope, None)
 
 
@@ -149,12 +314,24 @@ class AsgiLifespan:
             while True:
                 message = await receive()
                 if message["type"] == "lifespan.startup":
-                    for fn in self.on_startup:
-                        await fn()
+                    try:
+                        for fn in self.on_startup:
+                            await fn()
+                    except Exception as e:  # noqa: BLE001
+                        await send(
+                            {"type": "lifespan.startup.failed", "message": str(e)}
+                        )
+                        return
                     await send({"type": "lifespan.startup.complete"})
                 elif message["type"] == "lifespan.shutdown":
-                    for fn in self.on_shutdown:
-                        await fn()
+                    try:
+                        for fn in self.on_shutdown:
+                            await fn()
+                    except Exception as e:  # noqa: BLE001
+                        await send(
+                            {"type": "lifespan.shutdown.failed", "message": str(e)}
+                        )
+                        return
                     await send({"type": "lifespan.shutdown.complete"})
                     return
         else:
@@ -224,6 +401,11 @@ async def asgi_send_html(send, html, status=200, headers=None):
 
 
 async def asgi_send_redirect(send, location, status=302):
+    # Prevent open redirect vulnerability: collapse leading slashes and
+    # backslashes down to a single slash. //example.com is a protocol-relative
+    # URL, and browsers normalise backslashes to slashes so /\example.com would
+    # be treated as //example.com - https://github.com/simonw/datasette/issues/2680
+    location = re.sub(r"^[/\\]+", "/", location)
     await asgi_send(
         send,
         "",
@@ -261,6 +443,7 @@ async def asgi_send_file(
     headers = headers or {}
     if filename:
         headers["content-disposition"] = f'attachment; filename="{filename}"'
+
     first = True
     headers["content-length"] = str((await aiofiles.os.stat(str(filepath))).st_size)
     async with aiofiles.open(str(filepath), mode="rb") as fp:
@@ -281,11 +464,19 @@ async def asgi_send_file(
             )
 
 
+HASHED_STATIC_CACHE_CONTROL = "max-age=31536000, immutable, public"
+
+
 def asgi_static(root_path, chunk_size=4096, headers=None, content_type=None):
     root_path = Path(root_path)
+    static_headers = {}
+
+    if headers:
+        static_headers = headers.copy()
 
     async def inner_static(request, send):
         path = request.scope["url_route"]["kwargs"]["path"]
+        headers = static_headers.copy()
         try:
             full_path = (root_path / path).resolve().absolute()
         except FileNotFoundError:
@@ -301,11 +492,27 @@ def asgi_static(root_path, chunk_size=4096, headers=None, content_type=None):
             await asgi_send_html(send, "404: Path not inside root path", 404)
             return
         try:
-            await asgi_send_file(send, full_path, chunk_size=chunk_size)
+            # Calculate ETag for filepath
+            hash_value = request.args.get("_hash")
+            if (
+                hash_value
+                and hash_value == sha256_file(full_path, chunk_size=chunk_size)[:12]
+            ):
+                headers["Cache-Control"] = HASHED_STATIC_CACHE_CONTROL
+            etag = await calculate_etag(full_path, chunk_size=chunk_size)
+            headers["ETag"] = etag
+            if_none_match = request.headers.get("if-none-match")
+            if if_none_match and if_none_match == etag:
+                return await asgi_send(send, "", 304, headers=headers)
+            await asgi_send_file(
+                send, full_path, chunk_size=chunk_size, headers=headers
+            )
         except FileNotFoundError:
             await asgi_send_html(send, "404: File not found", 404)
             return
 
+    # Only the actual static-file handler can bypass dynamic response privacy.
+    inner_static._datasette_static = True
     return inner_static
 
 
@@ -351,9 +558,9 @@ class Response:
         httponly=False,
         samesite="lax",
     ):
-        assert samesite in SAMESITE_VALUES, "samesite should be one of {}".format(
-            SAMESITE_VALUES
-        )
+        assert (
+            samesite in SAMESITE_VALUES
+        ), f"samesite should be one of {SAMESITE_VALUES}"
         cookie = SimpleCookie()
         cookie[key] = value
         for prop_name, prop_value in (
@@ -398,6 +605,18 @@ class Response:
         )
 
     @classmethod
+    def error(cls, messages, status=400, headers=None):
+        """
+        A JSON error response using Datasette's standard error format.
+
+        messages can be a single string or a list of strings. For errors
+        that should content-negotiate between JSON and HTML, raise
+        Forbidden, NotFound, BadRequest or DatasetteError instead and let
+        Datasette's error handling hooks build the response.
+        """
+        return cls.json(error_body(messages, status), status=status, headers=headers)
+
+    @classmethod
     def redirect(cls, path, status=302, headers=None):
         headers = headers or {}
         headers["Location"] = path
@@ -425,3 +644,31 @@ class AsgiFileDownload:
             content_type=self.content_type,
             headers=self.headers,
         )
+
+
+class AsgiRunOnFirstRequest:
+    def __init__(self, asgi, on_startup):
+        assert isinstance(on_startup, list)
+        self.asgi = asgi
+        self.on_startup = on_startup
+        self._started = False
+        # Guards against concurrent early requests interleaving with startup:
+        # without this, several requests could all observe `_started is
+        # False` and proceed before any of them finish running the hooks.
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, scope, receive, send):
+        # Leave "lifespan" scope events alone - this shim only exists as a
+        # fallback for hosts that never send them. It wraps AsgiLifespan, so
+        # if it ran on_startup here too, a startup exception would escape
+        # before AsgiLifespan's own try/except got a chance to turn it into
+        # a lifespan.startup.failed message.
+        if scope["type"] != "lifespan" and not self._started:
+            async with self._lock:
+                # Re-check: another request may have finished startup while
+                # we were waiting for the lock.
+                if not self._started:
+                    for hook in self.on_startup:
+                        await hook()
+                    self._started = True
+        return await self.asgi(scope, receive, send)

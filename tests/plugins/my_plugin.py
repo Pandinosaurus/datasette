@@ -1,19 +1,28 @@
-from datasette import hookimpl
-from datasette.facets import Facet
-from datasette.utils import path_with_added_args
-from datasette.utils.asgi import asgi_send_json, Response
+import asyncio
 import base64
-import pint
 import json
+import urllib.parse
 
-ureg = pint.UnitRegistry()
+from datasette import hookimpl, tracer
+from datasette.facets import Facet
+from datasette.permissions import Action
+from datasette.resources import DatabaseResource
+from datasette.tokens import TokenHandler
+from datasette.utils import path_with_added_args
+from datasette.utils.asgi import Response, asgi_send_json
 
 
 @hookimpl
 def prepare_connection(conn, database, datasette):
     def convert_units(amount, from_, to_):
         """select convert_units(100, 'm', 'ft');"""
-        return (amount * ureg(from_)).to(to_).to_tuple()[0]
+        # Convert meters to feet
+        if from_ == "m" and to_ == "ft":
+            return amount * 3.28084
+        # Convert feet to meters
+        if from_ == "ft" and to_ == "m":
+            return amount / 3.28084
+        assert False, "Unsupported conversion"
 
     conn.create_function("convert_units", 3, convert_units)
 
@@ -37,9 +46,9 @@ def extra_css_urls(template, database, table, view_name, columns, request, datas
                             "database": database,
                             "table": table,
                             "view_name": view_name,
-                            "request_path": request.path
-                            if request is not None
-                            else None,
+                            "request_path": (
+                                request.path if request is not None else None
+                            ),
                             "added": (
                                 await datasette.get_database().execute("select 3 * 5")
                             ).first()[0],
@@ -96,22 +105,33 @@ def extra_body_script(
 
 
 @hookimpl
-def render_cell(value, column, table, database, datasette):
-    # Render some debug output in cell with value RENDER_CELL_DEMO
-    if value != "RENDER_CELL_DEMO":
-        return None
-    return json.dumps(
-        {
-            "column": column,
-            "table": table,
-            "database": database,
-            "config": datasette.plugin_config(
-                "name-of-plugin",
-                database=database,
-                table=table,
-            ),
-        }
-    )
+def render_cell(row, value, column, table, pks, database, datasette, request):
+    async def inner():
+        # Render some debug output in cell with value RENDER_CELL_DEMO
+        if value == "RENDER_CELL_DEMO":
+            data = {
+                "row": dict(row),
+                "column": column,
+                "table": table,
+                "database": database,
+                "pks": pks,
+                "config": datasette.plugin_config(
+                    "name-of-plugin",
+                    database=database,
+                    table=table,
+                ),
+            }
+            if request.args.get("_render_cell_extra"):
+                data["render_cell_extra"] = 1
+            return json.dumps(data)
+        elif value == "RENDER_CELL_ASYNC":
+            return (
+                await datasette.get_database(database).execute(
+                    "select 'RENDER_CELL_ASYNC_RESULT'"
+                )
+            ).single_value()
+
+    return inner
 
 
 @hookimpl
@@ -131,8 +151,15 @@ def extra_template_vars(
 
 
 @hookimpl
-def prepare_jinja2_environment(env):
-    env.filters["format_numeric"] = lambda s: f"{float(s):,.0f}"
+def prepare_jinja2_environment(env, datasette):
+    async def select_times_three(s):
+        db = datasette.get_database()
+        return (await db.execute("select 3 * ?", [int(s)])).first()[0]
+
+    async def inner():
+        env.filters["select_times_three"] = select_times_three
+
+    return inner
 
 
 @hookimpl
@@ -178,25 +205,15 @@ def actor_from_request(datasette, request):
 @hookimpl
 def asgi_wrapper():
     def wrap(app):
-        async def maybe_set_actor_in_scope(scope, recieve, send):
+        async def maybe_set_actor_in_scope(scope, receive, send):
             if b"_actor_in_scope" in scope.get("query_string", b""):
                 scope = dict(scope, actor={"id": "from-scope"})
                 print(scope)
-            await app(scope, recieve, send)
+            await app(scope, receive, send)
 
         return maybe_set_actor_in_scope
 
     return wrap
-
-
-@hookimpl
-def permission_allowed(actor, action):
-    if action == "this_is_allowed":
-        return True
-    elif action == "this_is_denied":
-        return False
-    elif action == "view-database-download":
-        return actor.get("can_download") if actor else None
 
 
 @hookimpl
@@ -243,24 +260,30 @@ def register_routes():
         # Mainly for the latest.datasette.io demo
         if request.method == "POST":
             response = Response.redirect("/")
-            response.set_cookie(
-                "ds_actor", datasette.sign({"a": {"id": "root"}}, "actor")
-            )
+            datasette.set_actor_cookie(response, {"id": "root"})
             return response
-        return Response.html(
-            """
+        return Response.html("""
             <form action="{}" method="POST">
                 <p>
                     <input type="hidden" name="csrftoken" value="{}">
-                    <input type="submit" value="Sign in as root user"></p>
+                    <input type="submit"
+                      value="Sign in as root user"
+                      style="font-size: 2em; padding: 0.1em 0.5em;">
+                </p>
             </form>
-        """.format(
-                request.path, request.scope["csrftoken"]()
-            )
-        )
+        """.format(request.path, request.scope["csrftoken"]()))
 
     def asgi_scope(scope):
         return Response.json(scope, default=repr)
+
+    async def parallel_queries(datasette):
+        db = datasette.get_database()
+        with tracer.trace_child_tasks():
+            one, two = await asyncio.gather(
+                db.execute("select coalesce(sleep(0.1), 1)"),
+                db.execute("select coalesce(sleep(0.1), 2)"),
+            )
+        return Response.json({"one": one.single_value(), "two": two.single_value()})
 
     return [
         (r"/one/$", one),
@@ -273,6 +296,7 @@ def register_routes():
         (r"/add-message/$", add_message),
         (r"/render-message/$", render_message),
         (r"/asgi-scope$", asgi_scope),
+        (r"/parallel-queries$", parallel_queries),
     ]
 
 
@@ -280,10 +304,10 @@ def register_routes():
 def startup(datasette):
     datasette._startup_hook_fired = True
 
+    # And test some import shortcuts too
+    from datasette import Forbidden, NotFound, Response, actor_matches_allow, hookimpl
 
-@hookimpl
-def canned_queries(datasette, database, actor):
-    return {"from_hook": f"select 1, '{actor['id'] if actor else 'null'}' as actor_id"}
+    _ = (Response, Forbidden, NotFound, hookimpl, actor_matches_allow)
 
 
 @hookimpl
@@ -302,9 +326,13 @@ def register_magic_parameters():
         else:
             raise KeyError
 
+    async def asyncrequest(key, request):
+        return key
+
     return [
         ("request", request),
         ("uuid", uuid),
+        ("asyncrequest", asyncrequest),
     ]
 
 
@@ -316,29 +344,273 @@ def forbidden(datasette, request, message):
 
 
 @hookimpl
-def menu_links(datasette, actor):
+def menu_links(datasette, actor, request):
     if actor:
-        return [{"href": datasette.urls.instance(), "label": "Hello"}]
+        label = "Hello"
+        if request.args.get("_hello"):
+            label += ", " + request.args["_hello"]
+        return [{"href": datasette.urls.instance(), "label": label}]
 
 
 @hookimpl
-def table_actions(datasette, database, table, actor):
+def table_actions(datasette, database, table, actor, request):
     if actor:
-        return [
+        actions = [
             {
                 "href": datasette.urls.instance(),
                 "label": f"Database: {database}",
             },
             {"href": datasette.urls.instance(), "label": f"Table: {table}"},
         ]
+        if request.args.get("_button"):
+            actions.append(
+                {
+                    "type": "button",
+                    "label": "Plugin button",
+                    "description": "Runs JavaScript from a plugin",
+                    "attrs": {
+                        "aria-label": f"Plugin button for {table}",
+                        "data-plugin-action": "plugin-button",
+                        "data-database": database,
+                        "data-table": table,
+                    },
+                }
+            )
+        return actions
 
 
 @hookimpl
-def database_actions(datasette, database, actor):
+def view_actions(datasette, database, view, actor):
     if actor:
         return [
             {
                 "href": datasette.urls.instance(),
                 "label": f"Database: {database}",
+            },
+            {"href": datasette.urls.instance(), "label": f"View: {view}"},
+        ]
+
+
+@hookimpl
+def query_actions(datasette, database, query_name, sql):
+    # Don't explain an explain (or a missing query)
+    if not sql or sql.lower().startswith("explain"):
+        return
+    return [
+        {
+            "href": datasette.urls.database(database)
+            + "/-/query"
+            + "?"
+            + urllib.parse.urlencode(
+                {
+                    "sql": "explain " + sql,
+                }
+            ),
+            "label": "Explain this query",
+            "description": "Runs a SQLite explain",
+        },
+    ]
+
+
+@hookimpl
+def row_actions(datasette, database, table, actor, row):
+    if actor:
+        return [
+            {
+                "href": datasette.urls.instance(),
+                "label": f"Row details for {actor['id']}",
+                "description": json.dumps(dict(row), default=repr),
+            },
+        ]
+
+
+@hookimpl
+def database_actions(datasette, database, actor, request):
+    if actor:
+        label = f"Database: {database}"
+        if request.args.get("_hello"):
+            label += " - " + request.args["_hello"]
+        return [
+            {
+                "href": datasette.urls.instance(),
+                "label": label,
             }
         ]
+
+
+@hookimpl
+def homepage_actions(datasette, actor, request):
+    if actor:
+        label = f"Custom homepage for: {actor['id']}"
+        return [
+            {
+                "href": datasette.urls.path("/-/custom-homepage"),
+                "label": label,
+            }
+        ]
+
+
+@hookimpl
+def register_actions(datasette):
+    extras_old = datasette.plugin_config("datasette-register-permissions") or {}
+    extras_new = datasette.plugin_config("datasette-register-actions") or {}
+
+    actions = [
+        Action(
+            name="action-from-plugin",
+            abbr="ap",
+            description="New action added by a plugin",
+            resource_class=DatabaseResource,
+        ),
+        Action(
+            name="view-collection",
+            abbr="vc",
+            description="View a collection",
+            resource_class=DatabaseResource,
+        ),
+        # Test actions for test_hook_custom_allowed (global actions - no resource_class)
+        Action(
+            name="this_is_allowed",
+            abbr=None,
+            description=None,
+        ),
+        Action(
+            name="this_is_denied",
+            abbr=None,
+            description=None,
+        ),
+        Action(
+            name="this_is_allowed_async",
+            abbr=None,
+            description=None,
+        ),
+        Action(
+            name="this_is_denied_async",
+            abbr=None,
+            description=None,
+        ),
+    ]
+
+    # Support old-style config for backwards compatibility
+    if extras_old:
+        for p in extras_old["permissions"]:
+            # Map old takes_database/takes_resource to new global/resource_class
+            if p.get("takes_database"):
+                # Has database -> DatabaseResource
+                actions.append(
+                    Action(
+                        name=p["name"],
+                        abbr=p["abbr"],
+                        description=p["description"],
+                        resource_class=DatabaseResource,
+                    )
+                )
+            else:
+                # No database -> global action (no resource_class)
+                actions.append(
+                    Action(
+                        name=p["name"],
+                        abbr=p["abbr"],
+                        description=p["description"],
+                    )
+                )
+
+    # Support new-style config
+    if extras_new:
+        for a in extras_new["actions"]:
+            # Check if this is a global action (no resource_class specified)
+            if not a.get("resource_class"):
+                actions.append(
+                    Action(
+                        name=a["name"],
+                        abbr=a["abbr"],
+                        description=a["description"],
+                    )
+                )
+            else:
+                # Map string resource_class to actual class
+                resource_class_map = {
+                    "DatabaseResource": DatabaseResource,
+                }
+                resource_class = resource_class_map.get(
+                    a.get("resource_class", "DatabaseResource"), DatabaseResource
+                )
+
+                actions.append(
+                    Action(
+                        name=a["name"],
+                        abbr=a["abbr"],
+                        description=a["description"],
+                        resource_class=resource_class,
+                    )
+                )
+
+    return actions
+
+
+@hookimpl
+def permission_resources_sql(datasette, actor, action):
+    from datasette.permissions import PermissionSQL
+
+    # Handle test actions used in test_hook_custom_allowed
+    if action == "this_is_allowed":
+        return PermissionSQL.allow(reason="test plugin allows this_is_allowed")
+    elif action == "this_is_denied":
+        return PermissionSQL.deny(reason="test plugin denies this_is_denied")
+    elif action == "this_is_allowed_async":
+        return PermissionSQL.allow(reason="test plugin allows this_is_allowed_async")
+    elif action == "this_is_denied_async":
+        return PermissionSQL.deny(reason="test plugin denies this_is_denied_async")
+    elif action == "view-database-download":
+        # Return rule based on actor's can_download permission
+        if actor and actor.get("can_download"):
+            return PermissionSQL.allow(reason="actor has can_download")
+        else:
+            return None  # No opinion
+    elif action == "view-database":
+        # Also grant view-database if actor has can_download (needed for download to work)
+        if actor and actor.get("can_download"):
+            return PermissionSQL.allow(
+                reason="actor has can_download, grants view-database"
+            )
+        else:
+            return None
+    elif action in (
+        "insert-row",
+        "create-table",
+        "drop-table",
+        "delete-row",
+        "update-row",
+    ):
+        # Special permissions for latest.datasette.io demos
+        actor_id = actor.get("id") if actor else None
+        if actor_id == "todomvc":
+            return PermissionSQL.allow(reason=f"todomvc actor allowed for {action}")
+
+    return None
+
+
+class HardcodedTokenHandler(TokenHandler):
+    name = "hardcoded"
+    _counter = 0
+
+    async def create_token(
+        self,
+        datasette,
+        actor_id,
+        *,
+        expires_after=None,
+        restrictions=None,
+    ):
+        HardcodedTokenHandler._counter += 1
+        return f"dstok_hardcoded_token_{HardcodedTokenHandler._counter}"
+
+    async def verify_token(self, datasette, token):
+        if token.startswith("dstok_hardcoded_token_"):
+            return {"id": "hardcoded-actor", "token": "hardcoded"}
+        return None
+
+
+@hookimpl
+def register_token_handler(datasette):
+    return HardcodedTokenHandler()

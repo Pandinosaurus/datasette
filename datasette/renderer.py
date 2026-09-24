@@ -1,9 +1,13 @@
 import json
+
+from datasette.extras import extra_names_from_request
 from datasette.utils import (
-    value_as_boolean,
-    remove_infinites,
     CustomJSONEncoder,
+    error_body,
     path_from_row_pks,
+    remove_infinites,
+    sqlite3,
+    value_as_boolean,
 )
 from datasette.utils.asgi import Response
 
@@ -19,16 +23,17 @@ def convert_specific_columns_to_json(rows, columns, json_cols):
             if column in json_cols:
                 try:
                     value = json.loads(value)
-                except (TypeError, ValueError) as e:
+                except (TypeError, ValueError):
                     pass
             new_row.append(value)
         new_rows.append(new_row)
     return new_rows
 
 
-def json_renderer(args, data, view_name):
+def json_renderer(request, args, data, error, truncated=None):
     """Render a response as JSON"""
     status_code = 200
+
     # Handle the _json= parameter which may modify data["rows"]
     json_cols = []
     if "_json" in args:
@@ -43,25 +48,37 @@ def json_renderer(args, data, view_name):
         data["rows"] = [remove_infinites(row) for row in data["rows"]]
 
     # Deal with the _shape option
-    shape = args.get("_shape", "arrays")
+    shape = args.get("_shape", "objects")
+    # if there's an error, ignore the shape entirely
+    data["ok"] = True
+    if error:
+        shape = "objects"
+        status_code = 400
+        data.update(error_body(error, status_code))
 
-    next_url = data.get("next_url")
-
+    if truncated is not None:
+        data["truncated"] = truncated
     if shape == "arrayfirst":
-        data = [row[0] for row in data["rows"]]
+        if not data["rows"]:
+            data = []
+        elif isinstance(data["rows"][0], sqlite3.Row):
+            data = [row[0] for row in data["rows"]]
+        else:
+            assert isinstance(data["rows"][0], dict)
+            data = [next(iter(row.values())) for row in data["rows"]]
     elif shape in ("objects", "object", "array"):
         columns = data.get("columns")
         rows = data.get("rows")
-        if rows and columns:
+        if rows and columns and not isinstance(rows[0], dict):
             data["rows"] = [dict(zip(columns, row)) for row in rows]
         if shape == "object":
-            error = None
+            shape_error = None
             if "primary_keys" not in data:
-                error = "_shape=object is only available on tables"
+                shape_error = "_shape=object is only available on tables"
             else:
                 pks = data["primary_keys"]
                 if not pks:
-                    error = (
+                    shape_error = (
                         "_shape=object not available for tables with no primary keys"
                     )
                 else:
@@ -70,21 +87,28 @@ def json_renderer(args, data, view_name):
                         pk_string = path_from_row_pks(row, pks, not pks)
                         object_rows[pk_string] = row
                     data = object_rows
-            if error:
-                data = {"ok": False, "error": error}
+            if shape_error:
+                status_code = 400
+                data = error_body(shape_error, status_code)
         elif shape == "array":
             data = data["rows"]
 
     elif shape == "arrays":
-        pass
+        if not data["rows"]:
+            pass
+        elif isinstance(data["rows"][0], sqlite3.Row):
+            data["rows"] = [list(row) for row in data["rows"]]
+        else:
+            data["rows"] = [list(row.values()) for row in data["rows"]]
     else:
         status_code = 400
-        data = {
-            "ok": False,
-            "error": f"Invalid _shape: {shape}",
-            "status": 400,
-            "title": None,
-        }
+        data = error_body(f"Invalid _shape: {shape}", status_code)
+
+    # Don't include "columns" in output
+    # https://github.com/simonw/datasette/issues/2136
+    if isinstance(data, dict) and "columns" not in extra_names_from_request(request):
+        data.pop("columns", None)
+
     # Handle _nl option for _shape=array
     nl = args.get("_nl", "")
     if nl and shape == "array":
@@ -94,8 +118,6 @@ def json_renderer(args, data, view_name):
         body = json.dumps(data, cls=CustomJSONEncoder)
         content_type = "application/json; charset=utf-8"
     headers = {}
-    if next_url:
-        headers["link"] = f'<{next_url}>; rel="next"'
     return Response(
         body, status=status_code, headers=headers, content_type=content_type
     )

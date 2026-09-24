@@ -6,11 +6,14 @@ on:
       version_tag:
         description: Tag to build and push
 
+permissions:
+  contents: read
+
 jobs:
   deploy_docker:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v7
     - name: Build and push to Docker Hub
       env:
         DOCKER_USER: ${{ secrets.DOCKER_USER }}

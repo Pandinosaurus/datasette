@@ -1,71 +1,69 @@
 import asyncio
-import uvicorn
-import click
-from click import formatting
-from click.types import CompositeParamType
-from click_default_group import DefaultGroup
+import functools
 import json
 import os
 import pathlib
 import shutil
-from subprocess import call
 import sys
-from runpy import run_module
+import textwrap
 import webbrowser
-from .app import Datasette, DEFAULT_SETTINGS, SETTINGS, SQLITE_LIMIT_ATTACHED, pm
+from runpy import run_module
+from subprocess import call
+
+import click
+import uvicorn
+from click import formatting
+from click.types import CompositeParamType
+from click_default_group import DefaultGroup
+
+from .app import (
+    DEFAULT_SETTINGS,
+    SETTINGS,
+    SQLITE_LIMIT_ATTACHED,
+    Datasette,
+    pm,
+)
+from .inspect import inspect_tables
 from .utils import (
-    StartupError,
-    check_connection,
-    find_spatialite,
-    parse_metadata,
     ConnectionProblem,
+    LoadExtension,
     SpatialiteConnectionProblem,
-    initial_path_for_datasette,
-    temporary_docker_directory,
-    value_as_boolean,
     SpatialiteNotFound,
+    StartupError,
     StaticMount,
     ValueAsBooleanError,
+    check_connection,
+    deep_dict_update,
+    find_spatialite,
+    initial_path_for_datasette,
+    pairs_to_nested_config,
+    parse_metadata,
+    temporary_docker_directory,
+    value_as_boolean,
 )
 from .utils.sqlite import sqlite3
 from .utils.testing import TestClient
 from .version import __version__
 
 
-class Config(click.ParamType):
-    # This will be removed in Datasette 1.0 in favour of class Setting
-    name = "config"
+def run_sync(coro_func):
+    """Run an async callable to completion on a fresh event loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro_func())
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
 
-    def convert(self, config, param, ctx):
-        if ":" not in config:
-            self.fail(f'"{config}" should be name:value', param, ctx)
-            return
-        name, value = config.split(":", 1)
-        if name not in DEFAULT_SETTINGS:
-            self.fail(
-                f"{name} is not a valid option (--help-config to see all)",
-                param,
-                ctx,
-            )
-            return
-        # Type checking
-        default = DEFAULT_SETTINGS[name]
-        if isinstance(default, bool):
-            try:
-                return name, value_as_boolean(value)
-            except ValueAsBooleanError:
-                self.fail(f'"{name}" should be on/off/true/false/1/0', param, ctx)
-                return
-        elif isinstance(default, int):
-            if not value.isdigit():
-                self.fail(f'"{name}" should be an integer', param, ctx)
-                return
-            return name, int(value)
-        elif isinstance(default, str):
-            return name, value
-        else:
-            # Should never happen:
-            self.fail("Invalid option")
+
+# Use Rich for tracebacks if it is installed
+try:
+    from rich.traceback import install
+
+    install(show_locals=True)
+except ImportError:
+    pass
 
 
 class Setting(CompositeParamType):
@@ -74,48 +72,65 @@ class Setting(CompositeParamType):
 
     def convert(self, config, param, ctx):
         name, value = config
-        if name not in DEFAULT_SETTINGS:
-            self.fail(
-                f"{name} is not a valid option (--help-config to see all)",
-                param,
-                ctx,
-            )
-            return
-        # Type checking
-        default = DEFAULT_SETTINGS[name]
-        if isinstance(default, bool):
-            try:
-                return name, value_as_boolean(value)
-            except ValueAsBooleanError:
-                self.fail(f'"{name}" should be on/off/true/false/1/0', param, ctx)
-                return
-        elif isinstance(default, int):
-            if not value.isdigit():
-                self.fail(f'"{name}" should be an integer', param, ctx)
-                return
-            return name, int(value)
-        elif isinstance(default, str):
-            return name, value
-        else:
-            # Should never happen:
-            self.fail("Invalid option")
+        if name in DEFAULT_SETTINGS:
+            # For backwards compatibility with how this worked prior to
+            # Datasette 1.0, we turn bare setting names into setting.name
+            # Type checking for those older settings
+            default = DEFAULT_SETTINGS[name]
+            name = f"settings.{name}"
+            if isinstance(default, bool):
+                try:
+                    return name, "true" if value_as_boolean(value) else "false"
+                except ValueAsBooleanError:
+                    self.fail(f'"{name}" should be on/off/true/false/1/0', param, ctx)
+            elif isinstance(default, int):
+                if not value.isdigit():
+                    self.fail(f'"{name}" should be an integer', param, ctx)
+                return name, value
+            elif isinstance(default, str):
+                return name, value
+            else:
+                # Should never happen:
+                self.fail("Invalid option")
+        return name, value
 
 
 def sqlite_extensions(fn):
-    return click.option(
+    fn = click.option(
         "sqlite_extensions",
         "--load-extension",
-        envvar="SQLITE_EXTENSIONS",
+        type=LoadExtension(),
+        envvar="DATASETTE_LOAD_EXTENSION",
         multiple=True,
-        help="Path to a SQLite extension to load",
+        help="Path to a SQLite extension to load, and optional entrypoint",
     )(fn)
+
+    # Wrap it in a custom error handler
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except AttributeError as e:
+            if "enable_load_extension" in str(e):
+                raise click.ClickException(textwrap.dedent("""
+                    Your Python installation does not have the ability to load SQLite extensions.
+
+                    More information: https://datasette.io/help/extensions
+                    """).strip())
+            raise
+
+    return wrapped
 
 
 @click.group(cls=DefaultGroup, default="serve", default_if_no_args=True)
 @click.version_option(version=__version__)
 def cli():
     """
-    Datasette!
+    Datasette is an open source multi-tool for exploring and publishing data
+
+    \b
+    About Datasette: https://datasette.io/
+    Full documentation: https://docs.datasette.io/
     """
 
 
@@ -124,9 +139,13 @@ def cli():
 @click.option("--inspect-file", default="-")
 @sqlite_extensions
 def inspect(files, inspect_file, sqlite_extensions):
-    app = Datasette([], immutables=files, sqlite_extensions=sqlite_extensions)
-    loop = asyncio.get_event_loop()
-    inspect_data = loop.run_until_complete(inspect_(files, sqlite_extensions))
+    """
+    Generate JSON summary of provided database files
+
+    This can then be passed to "datasette --inspect-file" to speed up count
+    operations against immutable database files.
+    """
+    inspect_data = run_sync(lambda: inspect_(files, sqlite_extensions))
     if inspect_file == "-":
         sys.stdout.write(json.dumps(inspect_data, indent=2))
     else:
@@ -138,17 +157,18 @@ async def inspect_(files, sqlite_extensions):
     app = Datasette([], immutables=files, sqlite_extensions=sqlite_extensions)
     data = {}
     for name, database in app.databases.items():
-        if name == "_internal":
-            # Don't include the in-memory _internal database
-            continue
-        counts = await database.table_counts(limit=3600 * 1000)
+
+        def _inspect_tables(conn):
+            return inspect_tables(conn, {})
+
+        tables = await database.execute_fn(_inspect_tables)
         data[name] = {
             "hash": database.hash,
             "size": database.size,
             "file": database.path,
             "tables": {
-                table_name: {"count": table_count}
-                for table_name, table_count in counts.items()
+                table_name: {"count": table["count"]}
+                for table_name, table in tables.items()
             },
         }
     return data
@@ -157,7 +177,6 @@ async def inspect_(files, sqlite_extensions):
 @cli.group()
 def publish():
     """Publish specified SQLite database files to the internet along with a Datasette-powered interface and API"""
-    pass
 
 
 # Register publish plugins
@@ -167,14 +186,22 @@ pm.hook.publish_subcommand(publish=publish)
 @cli.command()
 @click.option("--all", help="Include built-in default plugins", is_flag=True)
 @click.option(
+    "--requirements", help="Output requirements.txt of installed plugins", is_flag=True
+)
+@click.option(
     "--plugins-dir",
     type=click.Path(exists=True, file_okay=False, dir_okay=True),
     help="Path to directory containing custom plugins",
 )
-def plugins(all, plugins_dir):
-    """List currently available plugins"""
+def plugins(all, requirements, plugins_dir):
+    """List currently installed plugins"""
     app = Datasette([], plugins_dir=plugins_dir)
-    click.echo(json.dumps(app._plugins(all=all), indent=4))
+    if requirements:
+        for plugin in app._plugins():
+            if plugin["version"]:
+                click.echo("{}=={}".format(plugin["name"], plugin["version"]))
+    else:
+        click.echo(json.dumps(app._plugins(all=all), indent=4))
 
 
 @cli.command()
@@ -249,7 +276,7 @@ def package(
     port,
     **extra_metadata,
 ):
-    """Package specified SQLite files into a new datasette Docker container"""
+    """Package SQLite files into a Datasette Docker container"""
     if not shutil.which("docker"):
         click.secho(
             ' The package command requires "docker" to be installed and configured ',
@@ -284,15 +311,32 @@ def package(
 
 
 @cli.command()
-@click.argument("packages", nargs=-1, required=True)
+@click.argument("packages", nargs=-1)
 @click.option(
     "-U", "--upgrade", is_flag=True, help="Upgrade packages to latest version"
 )
-def install(packages, upgrade):
-    """Install Python packages - e.g. Datasette plugins - into the same environment as Datasette"""
+@click.option(
+    "-r",
+    "--requirement",
+    type=click.Path(exists=True),
+    help="Install from requirements file",
+)
+@click.option(
+    "-e",
+    "--editable",
+    help="Install a project in editable mode from this path",
+)
+def install(packages, upgrade, requirement, editable):
+    """Install plugins and packages from PyPI into the same environment as Datasette"""
+    if not packages and not requirement and not editable:
+        raise click.UsageError("Please specify at least one package to install")
     args = ["pip", "install"]
     if upgrade:
         args += ["--upgrade"]
+    if editable:
+        args += ["--editable", editable]
+    if requirement:
+        args += ["-r", requirement]
     args += list(packages)
     sys.argv = args
     run_module("pip", run_name="__main__")
@@ -302,7 +346,7 @@ def install(packages, upgrade):
 @click.argument("packages", nargs=-1, required=True)
 @click.option("-y", "--yes", is_flag=True, help="Don't ask for confirmation")
 def uninstall(packages, yes):
-    """Uninstall Python packages (e.g. plugins) from the Datasette environment"""
+    """Uninstall plugins and Python packages from the Datasette environment"""
     sys.argv = ["pip", "uninstall"] + list(packages) + (["-y"] if yes else [])
     run_module("pip", run_name="__main__")
 
@@ -332,6 +376,10 @@ def uninstall(packages, yes):
     default=8001,
     type=click.IntRange(0, 65535),
     help="Port for server, defaults to 8001. Use -p 0 to automatically assign an available port.",
+)
+@click.option(
+    "--uds",
+    help="Bind to a Unix domain socket",
 )
 @click.option(
     "--reload",
@@ -369,16 +417,17 @@ def uninstall(packages, yes):
 )
 @click.option("--memory", is_flag=True, help="Make /_memory database available")
 @click.option(
+    "-c",
     "--config",
-    type=Config(),
-    help="Deprecated: set config option using configname:value. Use --setting instead.",
-    multiple=True,
+    type=click.File(mode="r"),
+    help="Path to JSON/YAML Datasette configuration file",
 )
 @click.option(
+    "-s",
     "--setting",
     "settings",
     type=Setting(),
-    help="Setting, see docs.datasette.io/en/stable/config.html",
+    help="nested.key, value setting to use in Datasette configuration",
     multiple=True,
 )
 @click.option(
@@ -392,11 +441,29 @@ def uninstall(packages, yes):
     is_flag=True,
 )
 @click.option(
+    "--default-deny",
+    help="Deny all permissions by default",
+    is_flag=True,
+)
+@click.option(
     "--get",
     help="Run an HTTP GET request against this path, print results and exit",
 )
+@click.option(
+    "--headers",
+    is_flag=True,
+    help="Include HTTP headers in --get output",
+)
+@click.option(
+    "--token",
+    help="API token to send with --get requests",
+)
+@click.option(
+    "--actor",
+    help="Actor to use for --get requests (JSON string)",
+)
 @click.option("--version-note", help="Additional note to show on /-/versions")
-@click.option("--help-config", is_flag=True, help="Show available config options")
+@click.option("--help-settings", is_flag=True, help="Show available settings")
 @click.option("--pdb", is_flag=True, help="Launch debugger on any errors")
 @click.option(
     "-o",
@@ -416,18 +483,32 @@ def uninstall(packages, yes):
     help="Enable cross-database joins using the /_memory database",
 )
 @click.option(
+    "--nolock",
+    is_flag=True,
+    help="Ignore locking, open locked files in read-only mode",
+)
+@click.option(
     "--ssl-keyfile",
     help="SSL key file",
+    envvar="DATASETTE_SSL_KEYFILE",
 )
 @click.option(
     "--ssl-certfile",
     help="SSL certificate file",
+    envvar="DATASETTE_SSL_CERTFILE",
+)
+@click.option(
+    "--internal",
+    type=click.Path(),
+    help="Path to a persistent Datasette internal SQLite database",
+    envvar="DATASETTE_INTERNAL",
 )
 def serve(
     files,
     immutable,
     host,
     port,
+    uds,
     reload,
     cors,
     sqlite_extensions,
@@ -441,21 +522,27 @@ def serve(
     settings,
     secret,
     root,
+    default_deny,
     get,
+    headers,
+    token,
+    actor,
     version_note,
-    help_config,
+    help_settings,
     pdb,
     open_browser,
     create,
     crossdb,
+    nolock,
     ssl_keyfile,
     ssl_certfile,
+    internal,
     return_instance=False,
 ):
     """Serve up specified SQLite database files with a web UI"""
-    if help_config:
+    if help_settings:
         formatter = formatting.HelpFormatter()
-        with formatter.section("Config options"):
+        with formatter.section("Settings"):
             formatter.write_dl(
                 [
                     (option.name, f"{option.help} (default={option.default})")
@@ -467,9 +554,11 @@ def serve(
     if reload:
         import hupper
 
-        reloader = hupper.start_reloader("datasette.cli.serve")
+        reloader = hupper.start_reloader("datasette.cli.cli")
         if immutable:
             reloader.watch_files(immutable)
+        if config:
+            reloader.watch_files([config.name])
         if metadata:
             reloader.watch_files([metadata.name])
 
@@ -482,49 +571,91 @@ def serve(
     if metadata:
         metadata_data = parse_metadata(metadata.read())
 
-    combined_config = {}
+    config_data = None
     if config:
-        click.echo(
-            "--config name:value will be deprecated in Datasette 1.0, use --setting name value instead",
-            err=True,
+        config_data = parse_metadata(config.read())
+
+    config_data = config_data or {}
+
+    # Merge in settings from -s/--setting
+    if settings:
+        settings_updates = pairs_to_nested_config(settings)
+        # Merge recursively, to avoid over-writing nested values
+        # https://github.com/simonw/datasette/issues/2389
+        deep_dict_update(config_data, settings_updates)
+
+    kwargs = {
+        "immutables": immutable,
+        "cache_headers": not reload,
+        "cors": cors,
+        "inspect_data": inspect_data,
+        "config": config_data,
+        "metadata": metadata_data,
+        "sqlite_extensions": sqlite_extensions,
+        "template_dir": template_dir,
+        "plugins_dir": plugins_dir,
+        "static_mounts": static,
+        "settings": None,  # These are passed in config= now
+        "memory": memory,
+        "secret": secret,
+        "version_note": version_note,
+        "pdb": pdb,
+        "crossdb": crossdb,
+        "nolock": nolock,
+        "internal": internal,
+        "default_deny": default_deny,
+    }
+
+    # Separate directories from files
+    directories = [f for f in files if os.path.isdir(f)]
+    file_paths = [f for f in files if not os.path.isdir(f)]
+
+    # Handle config_dir - only one directory allowed
+    if len(directories) > 1:
+        raise click.ClickException(
+            "Cannot pass multiple directories. Pass a single directory as config_dir."
         )
-        combined_config.update(config)
-    combined_config.update(settings)
-
-    kwargs = dict(
-        immutables=immutable,
-        cache_headers=not reload,
-        cors=cors,
-        inspect_data=inspect_data,
-        metadata=metadata_data,
-        sqlite_extensions=sqlite_extensions,
-        template_dir=template_dir,
-        plugins_dir=plugins_dir,
-        static_mounts=static,
-        config=combined_config,
-        memory=memory,
-        secret=secret,
-        version_note=version_note,
-        pdb=pdb,
-        crossdb=crossdb,
-    )
-
-    # if files is a single directory, use that as config_dir=
-    if 1 == len(files) and os.path.isdir(files[0]):
-        kwargs["config_dir"] = pathlib.Path(files[0])
-        files = []
+    elif len(directories) == 1:
+        kwargs["config_dir"] = pathlib.Path(directories[0])
 
     # Verify list of files, create if needed (and --create)
-    for file in files:
+    for file in file_paths:
         if not pathlib.Path(file).exists():
             if create:
-                sqlite3.connect(file).execute("vacuum")
+                conn = sqlite3.connect(file)
+                conn.execute("vacuum")
+                conn.close()
             else:
                 raise click.ClickException(
-                    "Invalid value for '[FILES]...': Path '{}' does not exist.".format(
-                        file
-                    )
+                    f"Invalid value for '[FILES]...': Path '{file}' does not exist."
                 )
+
+    # Check for duplicate files by resolving all paths to their absolute forms
+    # Collect all database files that will be loaded (explicit files + config_dir files)
+    all_db_files = []
+
+    # Add explicit files
+    for file in file_paths:
+        all_db_files.append((file, pathlib.Path(file).resolve()))
+
+    # Add config_dir databases if config_dir is set
+    if "config_dir" in kwargs:
+        config_dir = kwargs["config_dir"]
+        for ext in ("db", "sqlite", "sqlite3"):
+            for db_file in config_dir.glob(f"*.{ext}"):
+                all_db_files.append((str(db_file), db_file.resolve()))
+
+    # Check for duplicates
+    seen = {}
+    for original_path, resolved_path in all_db_files:
+        if resolved_path in seen:
+            raise click.ClickException(
+                f"Duplicate database file: '{original_path}' and '{seen[resolved_path]}' "
+                f"both refer to {resolved_path}"
+            )
+        seen[resolved_path] = original_path
+
+    files = file_paths
 
     try:
         ds = Datasette(files, **kwargs)
@@ -537,43 +668,231 @@ def serve(
         # Private utility mechanism for writing unit tests
         return ds
 
-    # Run the "startup" plugin hooks
-    asyncio.get_event_loop().run_until_complete(ds.invoke_startup())
+    if headers and not get:
+        raise click.ClickException("--headers can only be used with --get")
 
-    # Run async sanity checks - but only if we're not under pytest
-    asyncio.get_event_loop().run_until_complete(check_databases(ds))
+    if token and not get:
+        raise click.ClickException("--token can only be used with --get")
 
     if get:
+        # --get means we don't run Uvicorn at all
+        run_sync(lambda: check_databases(ds))
+
+        try:
+            run_sync(ds.invoke_startup)
+        except StartupError as e:
+            raise click.ClickException(e.args[0])
+
+        # --get never launches background tasks: TestClient's request below
+        # flows through the full ASGI stack, including the
+        # AsgiRunOnFirstRequest fallback, which would otherwise launch them.
+        ds._suppress_background_tasks = True
+
         client = TestClient(ds)
-        response = client.get(get)
-        click.echo(response.text)
+        request_headers = {}
+        if token:
+            request_headers["Authorization"] = f"Bearer {token}"
+        cookies = {}
+        if actor:
+            cookies["ds_actor"] = client.actor_cookie(json.loads(actor))
+        response = client.get(get, headers=request_headers, cookies=cookies)
+
+        if headers:
+            # Output HTTP status code, headers, two newlines, then the response body
+            click.echo(f"HTTP/1.1 {response.status}")
+            for key, value in response.headers.items():
+                click.echo(f"{key}: {value}")
+            if response.text:
+                click.echo()
+                click.echo(response.text)
+        else:
+            click.echo(response.text)
+
         exit_code = 0 if response.status == 200 else 1
         sys.exit(exit_code)
         return
 
-    # Start the server
-    url = None
-    if root:
-        url = "http://{}:{}{}?token={}".format(
-            host, port, ds.urls.path("-/auth-token"), ds._root_token
-        )
-        print(url)
-    if open_browser:
-        if url is None:
-            # Figure out most convenient URL - to table, database or homepage
-            path = asyncio.get_event_loop().run_until_complete(
-                initial_path_for_datasette(ds)
+    # check_databases, invoke_startup() and the uvicorn server all run on a
+    # single event loop, so that anything a plugin's "startup" hook schedules
+    # on the loop (asyncio.create_task, Lock/Queue/Event objects, ...) is
+    # still alive when the server starts handling requests.
+    async def _serve_async():
+        # Populate internal catalog tables before invoke_startup
+        await check_databases(ds)
+
+        # Run the full startup sequence (immutable-database table-count
+        # precompute + the "startup" plugin hooks) via the same entry point
+        # AsgiLifespan/AsgiRunOnFirstRequest use, so it's not skipped when
+        # uvicorn's lifespan.startup fires moments later.
+        try:
+            await ds._startup_sequence()
+        except StartupError as e:
+            raise click.ClickException(e.args[0])
+
+        # Start the server
+        url = None
+        if root:
+            ds.root_enabled = True
+            url = "http://{}:{}{}?token={}".format(
+                host, port, ds.urls.path("-/auth-token"), ds._root_token
             )
-            url = f"http://{host}:{port}{path}"
-        webbrowser.open(url)
-    uvicorn_kwargs = dict(
-        host=host, port=port, log_level="info", lifespan="on", workers=1
+            click.echo(url)
+        if open_browser:
+            if url is None:
+                # Figure out most convenient URL - to table, database or homepage
+                path = await initial_path_for_datasette(ds)
+                url = f"http://{host}:{port}{path}"
+            webbrowser.open(url)
+        uvicorn_kwargs = {
+            "host": host,
+            "port": port,
+            "log_level": "info",
+            "lifespan": "on",
+            "workers": 1,
+        }
+        if uds:
+            uvicorn_kwargs["uds"] = uds
+        if ssl_keyfile:
+            uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
+        if ssl_certfile:
+            uvicorn_kwargs["ssl_certfile"] = ssl_certfile
+        server = uvicorn.Server(uvicorn.Config(ds.app(), **uvicorn_kwargs))
+        await server.serve()
+
+    asyncio.run(_serve_async())
+
+
+@cli.command()
+@click.argument("id")
+@click.option(
+    "--secret",
+    help="Secret used for signing the API tokens",
+    envvar="DATASETTE_SECRET",
+    required=True,
+)
+@click.option(
+    "-e",
+    "--expires-after",
+    help="Token should expire after this many seconds",
+    type=int,
+)
+@click.option(
+    "alls",
+    "-a",
+    "--all",
+    type=str,
+    metavar="ACTION",
+    multiple=True,
+    help="Restrict token to this action",
+)
+@click.option(
+    "databases",
+    "-d",
+    "--database",
+    type=(str, str),
+    metavar="DB ACTION",
+    multiple=True,
+    help="Restrict token to this action on this database",
+)
+@click.option(
+    "resources",
+    "-r",
+    "--resource",
+    type=(str, str, str),
+    metavar="DB RESOURCE ACTION",
+    multiple=True,
+    help="Restrict token to this action on this database resource (a table, SQL view or named query)",
+)
+@click.option(
+    "--debug",
+    help="Show decoded token",
+    is_flag=True,
+)
+@click.option(
+    "--plugins-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    help="Path to directory containing custom plugins",
+)
+def create_token(
+    id, secret, expires_after, alls, databases, resources, debug, plugins_dir
+):
+    """
+    Create a signed API token for the specified actor ID
+
+    Example:
+
+        datasette create-token root --secret mysecret
+
+    To allow only "view-database-download" for all databases:
+
+    \b
+        datasette create-token root --secret mysecret \\
+            --all view-database-download
+
+    To allow "create-table" against a specific database:
+
+    \b
+        datasette create-token root --secret mysecret \\
+            --database mydb create-table
+
+    To allow "insert-row" against a specific table:
+
+    \b
+        datasette create-token root --secret myscret \\
+            --resource mydb mytable insert-row
+
+    Restricted actions can be specified multiple times using
+    multiple --all, --database, and --resource options.
+
+    Add --debug to see a decoded version of the token.
+    """
+    ds = Datasette(secret=secret, plugins_dir=plugins_dir)
+
+    # Run ds.invoke_startup() in an event loop
+    try:
+        run_sync(ds.invoke_startup)
+    except StartupError as e:
+        raise click.ClickException(e.args[0])
+
+    # Warn about any unknown actions
+    actions = []
+    actions.extend(alls)
+    actions.extend([p[1] for p in databases])
+    actions.extend([p[2] for p in resources])
+    for action in actions:
+        if not ds.actions.get(action):
+            click.secho(
+                f"  Unknown permission: {action} ",
+                fg="red",
+                err=True,
+            )
+
+    from datasette.tokens import TokenRestrictions
+
+    restrictions = TokenRestrictions()
+    for action in alls:
+        restrictions.allow_all(action)
+    for database, action in databases:
+        restrictions.allow_database(database, action)
+    for database, resource, action in resources:
+        restrictions.allow_resource(database, resource, action)
+
+    token = run_sync(
+        lambda: ds.create_token(
+            id,
+            expires_after=expires_after,
+            restrictions=restrictions,
+            handler="signed",
+        )
     )
-    if ssl_keyfile:
-        uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
-    if ssl_certfile:
-        uvicorn_kwargs["ssl_certfile"] = ssl_certfile
-    uvicorn.run(ds.app(), **uvicorn_kwargs)
+    click.echo(token)
+    if debug:
+        encoded = token[len("dstok_") :]
+        click.echo("\nDecoded:\n")
+        click.echo(json.dumps(ds.unsign(encoded, namespace="token"), indent=2))
+
+
+pm.hook.register_commands(cli=cli)
 
 
 async def check_databases(ds):
@@ -597,7 +916,7 @@ async def check_databases(ds):
             )
         except ConnectionProblem as e:
             raise click.UsageError(
-                f"Connection to {database.path} failed check: {str(e.args[0])}"
+                f"Connection to {database.path} failed check: {e.args[0]!s}"
             )
     # If --crossdb and more than SQLITE_LIMIT_ATTACHED show warning
     if (
@@ -605,9 +924,5 @@ async def check_databases(ds):
         and len([db for db in ds.databases.values() if not db.is_memory])
         > SQLITE_LIMIT_ATTACHED
     ):
-        msg = (
-            "Warning: --crossdb only works with the first {} attached databases".format(
-                SQLITE_LIMIT_ATTACHED
-            )
-        )
+        msg = f"Warning: --crossdb only works with the first {SQLITE_LIMIT_ATTACHED} attached databases"
         click.echo(click.style(msg, bold=True, fg="yellow"), err=True)

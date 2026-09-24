@@ -5,7 +5,31 @@ Writing plugins
 
 You can write one-off plugins that apply to just one Datasette instance, or you can write plugins which can be installed using ``pip`` and can be shipped to the Python Package Index (`PyPI <https://pypi.org/>`__) for other people to install.
 
-Want to start by looking at an example? The `Datasette plugins directory <https://datasette.io/plugins>`__ lists more than 50 open source plugins with code you can explore. The :ref:`plugin hooks <plugin_hooks>` page includes links to example plugins for each of the documented hooks.
+Want to start by looking at an example? The `Datasette plugins directory <https://datasette.io/plugins>`__ lists more than 90 open source plugins with code you can explore. The :ref:`plugin hooks <plugin_hooks>` page includes links to example plugins for each of the documented hooks.
+
+.. _writing_plugins_tracing:
+
+Tracing plugin hooks
+--------------------
+
+The ``DATASETTE_TRACE_PLUGINS`` environment variable turns on detailed tracing showing exactly which hooks are being run. This can be useful for understanding how Datasette is using your plugin.
+
+.. code-block:: bash
+
+    DATASETTE_TRACE_PLUGINS=1 datasette mydb.db
+
+Example output::
+
+    actor_from_request:
+    {   'datasette': <datasette.app.Datasette object at 0x100bc7220>,
+        'request': <asgi.Request method="GET" url="http://127.0.0.1:4433/">}
+    Hook implementations:
+    [   <HookImpl plugin_name='codespaces', plugin=<module 'datasette_codespaces' from '.../site-packages/datasette_codespaces/__init__.py'>>,
+        <HookImpl plugin_name='datasette.actor_auth_cookie', plugin=<module 'datasette.actor_auth_cookie' from '.../datasette/datasette/actor_auth_cookie.py'>>,
+        <HookImpl plugin_name='datasette.default_permissions', plugin=<module 'datasette.default_permissions' from '.../datasette/default_permissions.py'>>]
+    Results:
+    [{'id': 'root'}]
+
 
 .. _writing_plugins_one_off:
 
@@ -18,9 +42,12 @@ The quickest way to start writing a plugin is to create a ``my_plugin.py`` file 
 
     from datasette import hookimpl
 
+
     @hookimpl
     def prepare_connection(conn):
-        conn.create_function('hello_world', 0, lambda: 'Hello world!')
+        conn.create_function(
+            "hello_world", 0, lambda: "Hello world!"
+        )
 
 If you save this in ``plugins/my_plugin.py`` you can then start Datasette like this::
 
@@ -41,7 +68,7 @@ Plugins that can be installed should be written as Python packages using a ``set
 
 The quickest way to start writing one an installable plugin is to use the `datasette-plugin <https://github.com/simonw/datasette-plugin>`__ cookiecutter template. This creates a new plugin structure for you complete with an example test and GitHub Actions workflows for testing and publishing your plugin.
 
-`Install cookiecutter <https://cookiecutter.readthedocs.io/en/1.7.2/installation.html>`__ and then run this command to start building a plugin using the template::
+`Install cookiecutter <https://cookiecutter.readthedocs.io/en/stable/installation.html>`__ and then run this command to start building a plugin using the template::
 
     cookiecutter gh:simonw/datasette-plugin
 
@@ -60,22 +87,22 @@ The example consists of two files: a ``setup.py`` file that defines the plugin:
 
     from setuptools import setup
 
-    VERSION = '0.1'
+    VERSION = "0.1"
 
     setup(
-        name='datasette-plugin-demos',
-        description='Examples of plugins for Datasette',
-        author='Simon Willison',
-        url='https://github.com/simonw/datasette-plugin-demos',
-        license='Apache License, Version 2.0',
+        name="datasette-plugin-demos",
+        description="Examples of plugins for Datasette",
+        author="Simon Willison",
+        url="https://github.com/simonw/datasette-plugin-demos",
+        license="Apache License, Version 2.0",
         version=VERSION,
-        py_modules=['datasette_plugin_demos'],
+        py_modules=["datasette_plugin_demos"],
         entry_points={
-            'datasette': [
-                'plugin_demos = datasette_plugin_demos'
+            "datasette": [
+                "plugin_demos = datasette_plugin_demos"
             ]
         },
-        install_requires=['datasette']
+        install_requires=["datasette"],
     )
 
 And a Python module file, ``datasette_plugin_demos.py``, that implements the plugin:
@@ -88,13 +115,14 @@ And a Python module file, ``datasette_plugin_demos.py``, that implements the plu
 
     @hookimpl
     def prepare_jinja2_environment(env):
-        env.filters['uppercase'] = lambda u: u.upper()
+        env.filters["uppercase"] = lambda u: u.upper()
 
 
     @hookimpl
     def prepare_connection(conn):
-        conn.create_function('random_integer', 2, random.randint)
-
+        conn.create_function(
+            "random_integer", 2, random.randint
+        )
 
 Having built a plugin in this way you can turn it into an installable package using the following command::
 
@@ -117,21 +145,34 @@ If your plugin has a ``static/`` directory, Datasette will automatically configu
 
     /-/static-plugins/NAME_OF_PLUGIN_PACKAGE/yourfile.js
 
-Use the ``datasette.urls.static_plugins(plugin_name, path)`` method to generate URLs to that asset that take the ``base_url`` setting into account, see :ref:`internals_datasette_urls`.
+Use the ``datasette.static(path, plugin=plugin_name)`` method to generate
+cache-busting URLs to those assets that take the ``base_url`` setting into
+account, see :ref:`datasette_static`.
+
+This can also be used from plugin templates as the ``static()`` template
+function:
+
+.. code-block:: html+jinja
+
+    <script src="{{ static('plugin.js', plugin='datasette_plugin_name') }}" defer></script>
 
 To bundle the static assets for a plugin in the package that you publish to PyPI, add the following to the plugin's ``setup.py``:
 
 .. code-block:: python
 
-        package_data={
-            'datasette_plugin_name': [
-                'static/plugin.js',
-            ],
-        },
+        package_data = (
+            {
+                "datasette_plugin_name": [
+                    "static/plugin.js",
+                ],
+            },
+        )
 
 Where ``datasette_plugin_name`` is the name of the plugin package (note that it uses underscores, not hyphens) and ``static/plugin.js`` is the path within that package to the static file.
 
 `datasette-cluster-map <https://github.com/simonw/datasette-cluster-map>`__ is a useful example of a plugin that includes packaged static assets in this way.
+
+See :ref:`customization_css` for tips on writing CSS that is compatible with Datasette's default CSS, including details of the ``core`` class for applying Datasette's default form element styles.
 
 .. _writing_plugins_custom_templates:
 
@@ -152,13 +193,49 @@ Templates should be bundled for distribution using the same ``package_data`` mec
 
 .. code-block:: python
 
-        package_data={
-            'datasette_plugin_name': [
-                'templates/my_template.html',
-            ],
-        },
+        package_data = (
+            {
+                "datasette_plugin_name": [
+                    "templates/my_template.html",
+                ],
+            },
+        )
 
 You can also use wildcards here such as ``templates/*.html``. See `datasette-edit-schema <https://github.com/simonw/datasette-edit-schema>`__ for an example of this pattern.
+
+.. _writing_plugins_custom_templates_breadcrumbs:
+
+Adding breadcrumbs
+~~~~~~~~~~~~~~~~~~
+
+Plugin templates that extend ``base.html`` can use the ``crumbs.nav()`` macro to display breadcrumb links back to the Datasette homepage, and optionally to a database and a table. Override the ``crumbs`` block to specify which links to include:
+
+.. code-block:: html+jinja
+
+    {% extends "base.html" %}
+
+    {% block title %}Manage {{ table }}{% endblock %}
+
+    {% block crumbs %}
+    <!-- For home / database / table -->
+    {{ crumbs.nav(request=request, database=database, table=table) }}
+    <!-- For home / database -->
+    {{ crumbs.nav(request=request, database=database) }}
+    {% endblock %}
+
+    {% block content %}
+    <h1>Manage {{ table }}</h1>
+    {% endblock %}
+
+The macro accepts these arguments:
+
+* ``request``: the current request, used to check the actor's permissions.
+* ``database``: an optional database name, as a string
+* ``table``: an optional table name, as a string. If you pass ``table``, you must also pass ``database``.
+
+For a database-level plugin page, use ``{{ crumbs.nav(request=request, database=database) }}``. For a page with just a homepage link, use ``{{ crumbs.nav(request=request) }}``, which is also the default provided by ``base.html`` if you do not override the block.
+
+The table-level example renders links in the form ``home / database / table``. Each link is only included if the current actor has permission to view that resource.
 
 .. _writing_plugins_configuration:
 
@@ -173,10 +250,14 @@ When you are writing plugins, you can access plugin configuration like this usin
 
 This will return the ``{"latitude_column": "lat", "longitude_column": "lng"}`` in the above example.
 
-If it cannot find the requested configuration at the table layer, it will fall back to the database layer and then the root layer. For example, a user may have set the plugin configuration option like so::
+If there is no configuration for that plugin, the method will return ``None``.
 
-    {
-        "databases: {
+If it cannot find the requested configuration at the table layer, it will fall back to the database layer and then the root layer. For example, a user may have set the plugin configuration option inside ``datasette.yaml`` like so:
+
+.. [[[cog
+    from metadata_doc import metadata_example
+    metadata_example(cog, {
+        "databases": {
             "sf-trees": {
                 "plugins": {
                     "datasette-cluster-map": {
@@ -186,21 +267,77 @@ If it cannot find the requested configuration at the table layer, it will fall b
                 }
             }
         }
-    }
+    })
+.. ]]]
+
+.. tab:: metadata.yaml
+
+    .. code-block:: yaml
+
+        databases:
+          sf-trees:
+            plugins:
+              datasette-cluster-map:
+                latitude_column: xlat
+                longitude_column: xlng
+
+
+.. tab:: metadata.json
+
+    .. code-block:: json
+
+        {
+          "databases": {
+            "sf-trees": {
+              "plugins": {
+                "datasette-cluster-map": {
+                  "latitude_column": "xlat",
+                  "longitude_column": "xlng"
+                }
+              }
+            }
+          }
+        }
+.. [[[end]]]
 
 In this case, the above code would return that configuration for ANY table within the ``sf-trees`` database.
 
-The plugin configuration could also be set at the top level of ``metadata.json``::
+The plugin configuration could also be set at the top level of ``datasette.yaml``:
 
-    {
-        "title": "This is the top-level title in metadata.json",
+.. [[[cog
+    metadata_example(cog, {
         "plugins": {
             "datasette-cluster-map": {
                 "latitude_column": "xlat",
                 "longitude_column": "xlng"
             }
         }
-    }
+    })
+.. ]]]
+
+.. tab:: metadata.yaml
+
+    .. code-block:: yaml
+
+        plugins:
+          datasette-cluster-map:
+            latitude_column: xlat
+            longitude_column: xlng
+
+
+.. tab:: metadata.json
+
+    .. code-block:: json
+
+        {
+          "plugins": {
+            "datasette-cluster-map": {
+              "latitude_column": "xlat",
+              "longitude_column": "xlng"
+            }
+          }
+        }
+.. [[[end]]]
 
 Now that ``datasette-cluster-map`` plugin configuration will apply to every table in every database.
 
@@ -223,7 +360,7 @@ To avoid accidentally conflicting with a database file that may be loaded into D
 
 - ``/-/upload-excel``
 
-Try to avoid registering URLs that clash with other plugins that your users might have installed. There is no central repository of reserved URL paths (yet) but you can review existing plugins by browsing the `datasette-plugin topic <https://github.com/topics/datasette-plugin>`__ on GitHub.
+Try to avoid registering URLs that clash with other plugins that your users might have installed. There is no central repository of reserved URL paths (yet) but you can review existing plugins by browsing the `plugins directory <https://datasette.io/plugins>`__.
 
 If your plugin includes functionality that relates to a specific database you could also register a URL route like this:
 
@@ -253,3 +390,65 @@ This object is exposed in templates as the ``urls`` variable, which can be used 
     Back to the <a href="{{ urls.instance() }}">Homepage</a>
 
 See :ref:`internals_datasette_urls` for full details on this object.
+
+.. _writing_plugins_extra_hooks:
+
+Plugins that define new plugin hooks
+------------------------------------
+
+Plugins can define new plugin hooks that other plugins can use to further extend their functionality.
+
+`datasette-graphql <https://github.com/simonw/datasette-graphql>`__ is one example of a plugin that does this. It defines a new hook called ``graphql_extra_fields``, `described here <https://github.com/simonw/datasette-graphql/blob/main/README.md#adding-custom-fields-with-plugins>`__, which other plugins can use to define additional fields that should be included in the GraphQL schema.
+
+To define additional hooks, add a file to the plugin called ``datasette_your_plugin/hookspecs.py`` with content that looks like this:
+
+.. code-block:: python
+
+    from pluggy import HookspecMarker
+
+    hookspec = HookspecMarker("datasette")
+
+
+    @hookspec
+    def name_of_your_hook_goes_here(datasette):
+        "Description of your hook."
+
+You should define your own hook name and arguments here, following the documentation for `Pluggy specifications <https://pluggy.readthedocs.io/en/stable/#specs>`__. Make sure to pick a name that is unlikely to clash with hooks provided by any other plugins.
+
+Then, to register your plugin hooks, add the following code to your ``datasette_your_plugin/__init__.py`` file:
+
+.. code-block:: python
+
+    from datasette.plugins import pm
+    from . import hookspecs
+
+    pm.add_hookspecs(hookspecs)
+
+This will register your plugin hooks as part of the ``datasette`` plugin hook namespace.
+
+Within your plugin code you can trigger the hook using this pattern:
+
+.. code-block:: python
+
+    from datasette.plugins import pm
+
+    for (
+        plugin_return_value
+    ) in pm.hook.name_of_your_hook_goes_here(
+        datasette=datasette
+    ):
+        # Do something with plugin_return_value
+        pass
+
+Other plugins will then be able to register their own implementations of your hook using this syntax:
+
+.. code-block:: python
+
+    from datasette import hookimpl
+
+
+    @hookimpl
+    def name_of_your_hook_goes_here(datasette):
+        return "Response from this plugin hook"
+
+These plugin implementations can accept 0 or more of the named arguments that you defined in your hook specification.

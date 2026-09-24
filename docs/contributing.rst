@@ -13,13 +13,14 @@ General guidelines
 * **main should always be releasable**. Incomplete features should live in branches. This ensures that any small bug fixes can be quickly released.
 * **The ideal commit** should bundle together the implementation, unit tests and associated documentation updates. The commit message should link to an associated issue.
 * **New plugin hooks** should only be shipped if accompanied by a separate release of a non-demo plugin that uses them.
+* **New user-facing views and documentation** should be added or updated alongside their implementation. The `/docs` folder includes pages for plugin hooks and built-in views—please ensure any new hooks or views are reflected there so the documentation tests continue to pass.
 
 .. _devenvironment:
 
 Setting up a development environment
 ------------------------------------
 
-If you have Python 3.6 or higher installed on your computer (on OS X the quickest way to do this `is using homebrew <https://docs.python-guide.org/starting/install3/osx/>`__) you can install an editable copy of Datasette using the following steps.
+If you have Python 3.10 or higher installed on your computer (on OS X the quickest way to do this `is using homebrew <https://docs.python-guide.org/starting/install3/osx/>`__) you can install an editable copy of Datasette using the following steps.
 
 If you want to use GitHub to publish your changes, first `create a fork of datasette <https://github.com/simonw/datasette/fork>`__ under your own GitHub account.
 
@@ -31,17 +32,18 @@ If you want to get started without creating your own fork, you can do this inste
 
     git clone git@github.com:simonw/datasette
 
-The next step is to create a virtual environment for your project and use it to install Datasette's dependencies::
+The quickest way to set up a development environment is to use `uv <https://github.com/astral-sh/uv>`__. From the repository root you can run the tests directly::
 
     cd datasette
-    # Create a virtual environment in ./venv
-    python3 -m venv ./venv
-    # Now activate the virtual environment, so pip can install into it
-    source venv/bin/activate
-    # Install Datasette and its testing dependencies
-    python3 -m pip install -e .[test]
+    uv run pytest
 
-That last line does most of the work: ``pip install -e`` means "install this package in a way that allows me to edit the source code in place". The ``.[test]`` option means "use the setup.py in this directory and install the optional testing dependencies as well".
+This will create a local ``.venv/`` and install Datasette plus its development dependencies.
+
+If you prefer to manage your own virtual environment with pip, create and activate one and then install the development dependency group::
+
+    python3 -m venv ./venv
+    source venv/bin/activate
+    python3 -m pip install -e . --group dev
 
 .. _contributing_running_tests:
 
@@ -50,15 +52,85 @@ Running the tests
 
 Once you have done this, you can run the Datasette unit tests from inside your ``datasette/`` directory using `pytest <https://docs.pytest.org/>`__ like so::
 
-    pytest
+    uv run pytest
 
 You can run the tests faster using multiple CPU cores with `pytest-xdist <https://pypi.org/project/pytest-xdist/>`__ like this::
 
-    pytest -n auto -m "not serial"
+    uv run pytest -n auto -m "not serial"
 
 ``-n auto`` detects the number of available cores automatically. The ``-m "not serial"`` skips tests that don't work well in a parallel test environment. You can run those tests separately like so::
 
-    pytest -m "serial"
+    uv run pytest -m "serial"
+
+.. _contributing_playwright:
+
+Running Playwright tests
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Datasette includes a small number of browser automation tests using Playwright_.
+These tests are skipped by default, so you can run the main test suite with
+``uv run pytest`` without installing Playwright or any browser binaries.
+
+.. _Playwright: https://playwright.dev/python/
+
+The Playwright tests use a separate dependency group. The easiest way to run
+them is using ``just``. First install the browser engine you want to test
+against. Chromium is used by default:
+
+.. code-block:: bash
+
+    just playwright-install
+
+Then run the Playwright test module:
+
+.. code-block:: bash
+
+    just playwright
+
+You can also run the same tests against Firefox or WebKit by installing that
+browser engine and passing it to ``just playwright``:
+
+.. code-block:: bash
+
+    just playwright-install firefox
+    just playwright firefox
+
+    just playwright-install webkit
+    just playwright webkit
+
+To install every supported browser engine and run the tests against all of
+them, use:
+
+.. code-block:: bash
+
+    just playwright-install-all
+    just playwright-all
+
+You can pass extra ``pytest`` options after the browser name:
+
+.. code-block:: bash
+
+    just playwright chromium -k permissions
+    just playwright-all -x
+
+You can add the ``--headed`` option to have Playwright open a browser window that you can see while it runs the tests. This only works if you specify a browser, for example:
+
+.. code-block:: bash
+
+    just playwright firefox --headed
+
+Combine this with ``-k`` to watch a specific test:
+
+.. code-block:: bash
+
+    just playwright chromium --headed -k test_insert_row
+
+If you are not using ``just``, the equivalent ``uv run`` commands are:
+
+.. code-block:: bash
+
+    uv run --group playwright playwright install chromium
+    uv run --group playwright pytest tests/test_playwright.py --playwright --browser chromium
 
 .. _contributing_using_fixtures:
 
@@ -71,11 +143,11 @@ You're going to need at least one SQLite database. A quick way to get started is
 
 You can create a copy of that database by running this command::
 
-    python tests/fixtures.py fixtures.db
+    uv run python tests/fixtures.py fixtures.db
 
 Now you can run Datasette against the new fixtures database like so::
 
-    datasette fixtures.db
+    uv run datasette fixtures.db
 
 This will start a server at ``http://127.0.0.1:8001/``.
 
@@ -83,15 +155,18 @@ Any changes you make in the ``datasette/templates`` or ``datasette/static`` fold
 
 If you want to change Datasette's Python code you can use the ``--reload`` option to cause Datasette to automatically reload any time the underlying code changes::
 
-    datasette --reload fixtures.db
+    uv run datasette --reload fixtures.db
+
+This also enables development mode for static asset cache busting, described in
+:ref:`customization_static_files`.
 
 You can also use the ``fixtures.py`` script to recreate the testing version of ``metadata.json`` used by the unit tests. To do that::
 
-    python tests/fixtures.py fixtures.db fixtures-metadata.json
+    uv run python tests/fixtures.py fixtures.db fixtures-metadata.json
 
 Or to output the plugins used by the tests, run this::
 
-    python tests/fixtures.py fixtures.db fixtures-metadata.json fixtures-plugins
+    uv run python tests/fixtures.py fixtures.db fixtures-metadata.json fixtures-plugins
     Test tables written to fixtures.db
     - metadata written to fixtures-metadata.json
     Wrote plugin: fixtures-plugins/register_output_renderer.py
@@ -102,7 +177,7 @@ Or to output the plugins used by the tests, run this::
 
 Then run Datasette like this::
 
-    datasette fixtures.db -m fixtures-metadata.json --plugins-dir=fixtures-plugins/
+    uv run datasette fixtures.db -m fixtures-metadata.json --plugins-dir=fixtures-plugins/
 
 .. _contributing_debugging:
 
@@ -111,9 +186,13 @@ Debugging
 
 Any errors that occur while Datasette is running while display a stack trace on the console.
 
-You can tell Datasette to open an interactive ``pdb`` debugger session if an error occurs using the ``--pdb`` option::
+You can tell Datasette to open an interactive ``pdb`` (or ``ipdb``, if present) debugger session if an error occurs using the ``--pdb`` option::
 
-    datasette --pdb fixtures.db
+    uv run datasette --pdb fixtures.db
+
+For `ipdb <https://pypi.org/project/ipdb/>`__, first run this::
+
+    uv run datasette install ipdb
 
 .. _contributing_formatting:
 
@@ -126,23 +205,47 @@ These formatters are enforced by Datasette's continuous integration: if a commit
 
 When developing locally, you can verify and correct the formatting of your code using these tools.
 
+If you are using `Just <https://github.com/casey/just>`__ the quickest way to run these is like so::
+
+    just black
+    just prettier
+
+Or run both at the same time::
+
+    just format
+
 .. _contributing_formatting_black:
 
 Running Black
 ~~~~~~~~~~~~~
 
-Black will be installed when you run ``pip install -e '.[test]'``. To test that your code complies with Black, run the following in your root ``datasette`` repository checkout::
+Black is installed as part of the development dependency group. To test that your code complies with Black, run the following in your root ``datasette`` repository checkout::
 
-    $ black . --check
+   uv run black . --check
+
+::
+
     All done! ✨ 🍰 ✨
     95 files would be left unchanged.
 
 If any of your code does not conform to Black you can run this to automatically fix those problems::
 
-    $ black .
-    reformatted ../datasette/setup.py
+    uv run black .
+
+::
+
+    reformatted ../datasette/app.py
     All done! ✨ 🍰 ✨
     1 file reformatted, 94 files left unchanged.
+
+.. _contributing_formatting_blacken_docs:
+
+blacken-docs
+~~~~~~~~~~~~
+
+The `blacken-docs <https://pypi.org/project/blacken-docs/>`__ command applies Black formatting rules to code examples in the documentation. Run it like this::
+
+    uv run blacken-docs -l 60 docs/*.rst
 
 .. _contributing_formatting_prettier:
 
@@ -151,11 +254,14 @@ Prettier
 
 To install Prettier, `install Node.js <https://nodejs.org/en/download/package-manager/>`__ and then run the following in the root of your ``datasette`` repository checkout::
 
-    $ npm install
+    npm install
 
 This will install Prettier in a ``node_modules`` directory. You can then check that your code matches the coding style like so::
 
-    $ npm run prettier -- --check
+    npm run prettier -- --check
+
+::
+
     > prettier
     > prettier 'datasette/static/*[!.min].js' "--check"
 
@@ -165,7 +271,7 @@ This will install Prettier in a ``node_modules`` directory. You can then check t
 
 You can fix any problems by running::
 
-    $ npm run fix
+    npm run fix
 
 .. _contributing_documentation:
 
@@ -176,17 +282,10 @@ Datasette's documentation lives in the ``docs/`` directory and is deployed autom
 
 The documentation is written using reStructuredText. You may find this article on `The subset of reStructuredText worth committing to memory <https://simonwillison.net/2018/Aug/25/restructuredtext/>`__ useful.
 
-You can build it locally by installing ``sphinx`` and ``sphinx_rtd_theme`` in your Datasette development environment and then running ``make html`` directly in the ``docs/`` directory::
+You can build it locally once you have installed the development dependency group (which includes Sphinx and related tools) and then running ``make html`` directly in the ``docs/`` directory::
 
-    # You may first need to activate your virtual environment:
-    source venv/bin/activate
-
-    # Install the dependencies needed to build the docs
-    pip install -e .[docs]
-
-    # Now build the docs
     cd docs/
-    make html
+    uv run make html
 
 This will create the HTML version of the documentation in ``docs/_build/html``. You can open it in your browser like so::
 
@@ -196,11 +295,46 @@ Any time you make changes to a ``.rst`` file you can re-run ``make html`` to upd
 
 For added productivity, you can use use `sphinx-autobuild <https://pypi.org/project/sphinx-autobuild/>`__ to run Sphinx in auto-build mode. This will run a local webserver serving the docs that automatically rebuilds them and refreshes the page any time you hit save in your editor.
 
-``sphinx-autobuild`` will have been installed when you ran ``pip install -e .[docs]``. In your ``docs/`` directory you can start the server by running the following::
+``sphinx-autobuild`` is included in the development dependency group. In your ``docs/`` directory you can start the server by running the following::
 
-    make livehtml
+    uv run make livehtml
 
 Now browse to ``http://localhost:8000/`` to view the documentation. Any edits you make should be instantly reflected in your browser.
+
+.. _contributing_documentation_cog:
+
+Running Cog
+~~~~~~~~~~~
+
+Some pages of documentation (in particular the :ref:`cli_reference`) are automatically updated using `Cog <https://github.com/nedbat/cog>`__.
+
+To update these pages, run the following command::
+
+    uv run cog -r docs/*.rst
+
+.. _contributing_template_contexts:
+
+Documented template contexts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Datasette's documented template contexts are part of the public API for custom templates. They are defined as dataclasses next to the view code that renders them, for example ``DatabaseContext`` and ``QueryContext`` in ``datasette/views/database.py``.
+
+Every documented context class inherits from ``datasette.views.Context``. Fields that are added directly by view code should be declared as dataclass fields with ``help`` metadata, which is used to generate :ref:`template_context`. Fields resolved through the page extras system should use ``from_extra()`` so their documentation comes from the matching ``Extra`` class.
+
+Use ``documented_template`` on each context class to record the canonical template named in the generated documentation. This should be a string such as ``"database.html"``. Runtime template selection still happens in the view code, since most pages consider more specific template names before falling back to the canonical one.
+
+When a context field contains repeated structured data, prefer a small nested dataclass over an anonymous dictionary. For example, a field containing table summaries should be annotated as ``list[DatabaseTable]`` where ``DatabaseTable`` is a dataclass describing the keys and value types. This keeps the Python contract and generated documentation clear. JSON responses and ``?_context=1`` debug output will convert nested dataclasses back to JSON objects at the response boundary.
+
+.. _contributing_continuous_deployment:
+
+Continuously deployed demo instances
+------------------------------------
+
+The demo instance at `latest.datasette.io <https://latest.datasette.io/>`__ is re-deployed automatically to Google Cloud Run for every push to ``main`` that passes the test suite. This is implemented by the GitHub Actions workflow at `.github/workflows/deploy-latest.yml <https://github.com/simonw/datasette/blob/main/.github/workflows/deploy-latest.yml>`__.
+
+Specific branches can also be set to automatically deploy by adding them to the ``on: push: branches`` block at the top of the workflow YAML file. Branches configured in this way will be deployed to a new Cloud Run service whether or not their tests pass.
+
+The Cloud Run URL for a branch demo can be found in the GitHub Actions logs.
 
 .. _contributing_release:
 
@@ -214,6 +348,7 @@ Datasette releases are performed using tags. When a new release is published on 
 * Re-point the "latest" tag on Docker Hub to the new image
 * Build a wheel bundle of the underlying Python source code
 * Push that new wheel up to PyPI: https://pypi.org/project/datasette/
+* If the release is an alpha, navigate to https://readthedocs.org/projects/datasette/versions/ and search for the tag name in the "Activate a version" filter, then mark that version as "active" to ensure it will appear on the public ReadTheDocs documentation site.
 
 To deploy new releases you will need to have push access to the main Datasette GitHub repository.
 
@@ -243,7 +378,11 @@ You can generate the list of issue references for a specific release by copying 
 
 To create the tag for the release, create `a new release <https://github.com/simonw/datasette/releases/new>`__ on GitHub matching the new version number. You can convert the release notes to Markdown by copying and pasting the rendered HTML into this `Paste to Markdown tool <https://euangoddard.github.io/clipboard2markdown/>`__.
 
-Finally, post a news item about the release on `datasette.io <https://datasette.io/>`__ by editing the `news.yaml <https://github.com/simonw/datasette.io/blob/main/news.yaml>`__ file in that site's repository.
+Don't forget to create the release from the correct branch - usually ``main``, but sometimes ``0.64.x`` or similar for a bugfix release.
+
+While the release is running you can confirm that the correct commits made it into the release using the https://github.com/simonw/datasette/compare/0.64.6...0.64.7 URL.
+
+Finally, post a news item about the release on `datasette.io <https://datasette.io/>`__ by editing the `news.yaml <https://github.com/simonw/datasette.io/blob/main/news.yaml>`__ file in that site's repository. Use `this preview tool <https://tools.simonwillison.net/datasette-io-preview>`__ to preview the edits to the YAML.
 
 .. _contributing_alpha_beta:
 
@@ -291,20 +430,17 @@ Upgrading CodeMirror
 
 Datasette bundles `CodeMirror <https://codemirror.net/>`__ for the SQL editing interface, e.g. on `this page <https://latest.datasette.io/fixtures>`__. Here are the steps for upgrading to a new version of CodeMirror:
 
-* Download and extract latest CodeMirror zip file from https://codemirror.net/codemirror.zip
-* Rename ``lib/codemirror.js`` to ``codemirror-5.57.0.js`` (using latest version number)
-* Rename ``lib/codemirror.css`` to ``codemirror-5.57.0.css``
-* Rename ``mode/sql/sql.js`` to ``codemirror-5.57.0-sql.js``
-* Edit both JavaScript files to make the top license comment a ``/* */`` block instead of multiple ``//`` lines
-* Minify the JavaScript files like this::
+* Install the packages with::
 
-       npx uglify-js codemirror-5.57.0.js -o codemirror-5.57.0.min.js --comments '/LICENSE/'
-       npx uglify-js codemirror-5.57.0-sql.js -o codemirror-5.57.0-sql.min.js --comments '/LICENSE/'
+    npm i codemirror @codemirror/lang-sql
 
-* Check that the LICENSE comment did indeed survive minification
-* Minify the CSS file like this::
+* Build the bundle using the version number from package.json with::
 
-       npx clean-css-cli codemirror-5.57.0.css -o codemirror-5.57.0.min.css
+    node_modules/.bin/rollup datasette/static/cm-editor-6.0.1.js \
+      -f iife \
+      -n cm \
+      -o datasette/static/cm-editor-6.0.1.bundle.js \
+      -p @rollup/plugin-node-resolve \
+      -p @rollup/plugin-terser
 
-* Edit the ``_codemirror.html`` template to reference the new files
-* ``git rm`` the old files, ``git add`` the new files
+* Update the version reference in the ``codemirror.html`` template.

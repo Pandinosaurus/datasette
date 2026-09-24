@@ -1,54 +1,71 @@
 import asyncio
-from contextlib import contextmanager
-import time
 import json
+import time
 import traceback
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+from markupsafe import escape
 
 tracers = {}
 
 TRACE_RESERVED_KEYS = {"type", "start", "end", "duration_ms", "traceback"}
 
-
-# asyncio.current_task was introduced in Python 3.7:
-for obj in (asyncio, asyncio.Task):
-    current_task = getattr(obj, "current_task", None)
-    if current_task is not None:
-        break
+trace_task_id = ContextVar("trace_task_id", default=None)
 
 
 def get_task_id():
+    current = trace_task_id.get(None)
+    if current is not None:
+        return current
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         return None
-    return id(current_task(loop=loop))
+    return id(asyncio.current_task(loop=loop))
 
 
 @contextmanager
-def trace(type, **kwargs):
+def trace_child_tasks():
+    token = trace_task_id.set(get_task_id())
+    try:
+        yield
+    finally:
+        trace_task_id.reset(token)
+
+
+@contextmanager
+def trace(trace_type, **kwargs):
     assert not TRACE_RESERVED_KEYS.intersection(
         kwargs.keys()
     ), f".trace() keyword parameters cannot include {TRACE_RESERVED_KEYS}"
     task_id = get_task_id()
     if task_id is None:
-        yield
+        yield kwargs
         return
     tracer = tracers.get(task_id)
     if tracer is None:
-        yield
+        yield kwargs
         return
     start = time.perf_counter()
-    yield
-    end = time.perf_counter()
-    trace_info = {
-        "type": type,
-        "start": start,
-        "end": end,
-        "duration_ms": (end - start) * 1000,
-        "traceback": traceback.format_list(traceback.extract_stack(limit=6)[:-3]),
-    }
-    trace_info.update(kwargs)
-    tracer.append(trace_info)
+    captured_error = None
+    try:
+        yield kwargs
+    except Exception as ex:
+        captured_error = ex
+        raise
+    finally:
+        end = time.perf_counter()
+        trace_info = {
+            "type": trace_type,
+            "start": start,
+            "end": end,
+            "duration_ms": (end - start) * 1000,
+            "traceback": traceback.format_list(traceback.extract_stack(limit=6)[:-3]),
+            "error": str(captured_error) if captured_error else None,
+        }
+        trace_info.update(kwargs)
+        tracer.append(trace_info)
 
 
 @contextmanager
@@ -83,6 +100,7 @@ class AsgiTracer:
 
         async def wrapped_send(message):
             nonlocal accumulated_body, size_limit_exceeded, response_headers
+
             if message["type"] == "http.response.start":
                 response_headers = message["headers"]
                 await send(message)
@@ -95,11 +113,12 @@ class AsgiTracer:
             # Accumulate body until the end or until size is exceeded
             accumulated_body += message["body"]
             if len(accumulated_body) > self.max_body_bytes:
+                # Send what we have accumulated so far
                 await send(
                     {
                         "type": "http.response.body",
                         "body": accumulated_body,
-                        "more_body": True,
+                        "more_body": bool(message.get("more_body")),
                     }
                 )
                 size_limit_exceeded = True
@@ -114,17 +133,17 @@ class AsgiTracer:
                     "num_traces": len(traces),
                     "traces": traces,
                 }
-                try:
-                    content_type = [
+                content_type = next(
+                    (
                         v.decode("utf8")
                         for k, v in response_headers
                         if k.lower() == b"content-type"
-                    ][0]
-                except IndexError:
-                    content_type = ""
+                    ),
+                    "",
+                )
                 if "text/html" in content_type and b"</body>" in accumulated_body:
-                    extra = json.dumps(trace_info, indent=2)
-                    extra_html = f"<pre>{extra}</pre></body>".encode("utf8")
+                    extra = escape(json.dumps(trace_info, indent=2))
+                    extra_html = f"<pre>{extra}</pre></body>".encode()
                     accumulated_body = accumulated_body.replace(b"</body>", extra_html)
                 elif "json" in content_type and accumulated_body.startswith(b"{"):
                     data = json.loads(accumulated_body.decode("utf8"))

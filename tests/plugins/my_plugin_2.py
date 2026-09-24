@@ -1,7 +1,10 @@
-from datasette import hookimpl
-from functools import wraps
-import jinja2
 import json
+from functools import wraps
+
+import markupsafe
+
+from datasette import hookimpl
+from datasette.utils.asgi import Response
 
 
 @hookimpl
@@ -32,17 +35,13 @@ def render_cell(value, database):
     if set(data.keys()) != {"href", "label"}:
         return None
     href = data["href"]
-    if not (
-        href.startswith("/")
-        or href.startswith("http://")
-        or href.startswith("https://")
-    ):
+    if not (href.startswith(("/", "http://", "https://"))):
         return None
-    return jinja2.Markup(
+    return markupsafe.Markup(
         '<a data-database="{database}" href="{href}">{label}</a>'.format(
             database=database,
-            href=jinja2.escape(data["href"]),
-            label=jinja2.escape(data["label"] or "") or "&nbsp;",
+            href=markupsafe.escape(data["href"]),
+            label=markupsafe.escape(data["label"] or "") or "&nbsp;",
         )
     )
 
@@ -53,7 +52,7 @@ def extra_template_vars(template, database, table, view_name, request, datasette
     datasette._last_request = request
 
     async def query_database(sql):
-        first_db = list(datasette.databases.keys())[0]
+        first_db = next(iter(datasette.databases.keys()))
         return (await datasette.execute(first_db, sql)).rows[0][0]
 
     async def inner():
@@ -76,7 +75,7 @@ def extra_template_vars(template, database, table, view_name, request, datasette
 def asgi_wrapper(datasette):
     def wrap_with_databases_header(app):
         @wraps(app)
-        async def add_x_databases_header(scope, recieve, send):
+        async def add_x_databases_header(scope, receive, send):
             async def wrapped_send(event):
                 if event["type"] == "http.response.start":
                     original_headers = event.get("headers") or []
@@ -93,7 +92,7 @@ def asgi_wrapper(datasette):
                     }
                 await send(event)
 
-            await app(scope, recieve, wrapped_send)
+            await app(scope, receive, wrapped_send)
 
         return add_x_databases_header
 
@@ -113,37 +112,31 @@ def actor_from_request(datasette, request):
 
 
 @hookimpl
-def permission_allowed(datasette, actor, action):
-    # Testing asyncio version of permission_allowed
-    async def inner():
-        assert 2 == (await datasette.get_database().execute("select 1 + 1")).first()[0]
-        if action == "this_is_allowed_async":
-            return True
-        elif action == "this_is_denied_async":
-            return False
-
-    return inner
+def prepare_jinja2_environment(env, datasette):
+    env.filters["format_numeric"] = lambda s: f"{float(s):,.0f}"
+    env.filters["to_hello"] = lambda s: datasette._HELLO
 
 
 @hookimpl
 def startup(datasette):
     async def inner():
-        result = await datasette.get_database().execute("select 1 + 1")
+        # Run against _internal so tests that use the ds_client fixture
+        # (which has no databases yet on startup) do not fail:
+        internal_db = datasette.get_internal_database()
+        result = await internal_db.execute("select 1 + 1")
         datasette._startup_hook_calculation = result.first()[0]
-
-    return inner
-
-
-@hookimpl
-def canned_queries(datasette, database):
-    async def inner():
-        return {
-            "from_async_hook": "select {}".format(
-                (
-                    await datasette.get_database(database).execute("select 1 + 1")
-                ).first()[0]
-            )
-        }
+        # Check that metadata tables have been populated before startup fires
+        metadata_rows = await internal_db.execute(
+            "select key, value from metadata_instance"
+        )
+        datasette._startup_metadata_keys = [row["key"] for row in metadata_rows]
+        # Check that catalog/schema tables have been populated before startup fires
+        catalog_rows = await internal_db.execute(
+            "select database_name from catalog_databases"
+        )
+        datasette._startup_catalog_databases = [
+            row["database_name"] for row in catalog_rows
+        ]
 
     return inner
 
@@ -158,9 +151,47 @@ def menu_links(datasette, actor):
 
 
 @hookimpl
-def table_actions(datasette, database, table, actor):
+def table_actions(datasette, database, table, actor, request):
     async def inner():
         if actor:
-            return [{"href": datasette.urls.instance(), "label": "From async"}]
+            label = "From async"
+            if request.args.get("_hello"):
+                label += " " + request.args["_hello"]
+            return [{"href": datasette.urls.instance(), "label": label}]
 
     return inner
+
+
+@hookimpl
+def register_routes(datasette):
+    config = datasette.plugin_config("register-route-demo")
+    if not config:
+        return
+    path = config["path"]
+
+    def new_table(request):
+        return Response.text(f"/db/table: {sorted(request.url_vars.items())}")
+
+    return [
+        (rf"/{path}/$", lambda: Response.text(path.upper())),
+        # Also serves to demonstrate over-ride of default paths:
+        (r"/(?P<db_name>[^/]+)/(?P<table_and_format>[^/]+?$)", new_table),
+    ]
+
+
+@hookimpl
+def handle_exception(datasette, request, exception):
+    datasette._exception_hook_fired = (request, exception)
+    if request.args.get("_custom_error"):
+        return Response.text("_custom_error")
+    elif request.args.get("_custom_error_async"):
+
+        async def inner():
+            return Response.text("_custom_error_async")
+
+        return inner
+
+
+@hookimpl(specname="register_routes")
+def register_triger_error():
+    return ((r"/trigger-error", lambda: 1 / 0),)

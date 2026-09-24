@@ -1,8 +1,9 @@
-from datasette.cli import cli
-from click.testing import CliRunner
-import urllib
 import sqlite3
-from .fixtures import app_client_two_attached_databases_crossdb_enabled
+import urllib
+
+from click.testing import CliRunner
+
+from datasette.cli import cli
 
 
 def test_crossdb_join(app_client_two_attached_databases_crossdb_enabled):
@@ -25,7 +26,8 @@ def test_crossdb_join(app_client_two_attached_databases_crossdb_enabled):
       fixtures.searchable
     """
     response = app_client.get(
-        "/_memory.json?" + urllib.parse.urlencode({"sql": sql, "_shape": "array"})
+        "/_memory/-/query.json?"
+        + urllib.parse.urlencode({"sql": sql, "_shape": "array"})
     )
     assert response.status == 200
     assert response.json == [
@@ -40,11 +42,12 @@ def test_crossdb_warning_if_too_many_databases(tmp_path_factory):
     db_dir = tmp_path_factory.mktemp("dbs")
     dbs = []
     for i in range(11):
-        path = str(db_dir / "db_{}.db".format(i))
+        path = str(db_dir / f"db_{i}.db")
         conn = sqlite3.connect(path)
         conn.execute("vacuum")
+        conn.close()
         dbs.append(path)
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     result = runner.invoke(
         cli,
         [
@@ -67,9 +70,10 @@ def test_crossdb_attached_database_list_display(
 ):
     app_client = app_client_two_attached_databases_crossdb_enabled
     response = app_client.get("/_memory")
+    app_client.get("/")
     for fragment in (
         "databases are attached to this connection",
         "<li><strong>fixtures</strong> - ",
-        "<li><strong>extra database</strong> - ",
+        '<li><strong>extra database</strong> - <a href="/extra+database/-/query?sql=',
     ):
         assert fragment in response.text

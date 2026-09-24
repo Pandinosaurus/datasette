@@ -1,15 +1,14 @@
 import hashlib
 
 from .utils import (
-    detect_spatialite,
     detect_fts,
     detect_primary_keys,
+    detect_spatialite,
     escape_sqlite,
     get_all_foreign_keys,
-    table_columns,
     sqlite3,
+    table_columns,
 )
-
 
 HASH_BLOCK_SIZE = 1024 * 1024
 
@@ -70,16 +69,11 @@ def inspect_tables(conn, database_metadata):
         tables[table]["foreign_keys"] = info
 
     # Mark tables 'hidden' if they relate to FTS virtual tables
-    hidden_tables = [
-        r["name"]
-        for r in conn.execute(
-            """
+    hidden_tables = [r["name"] for r in conn.execute("""
                 select name from sqlite_master
                 where rootpage = 0
                 and sql like '%VIRTUAL TABLE%USING FTS%'
-            """
-        )
-    ]
+            """)]
 
     if detect_spatialite(conn):
         # Also hide Spatialite internal tables
@@ -94,20 +88,17 @@ def inspect_tables(conn, database_metadata):
             "views_geometry_columns",
             "virts_geometry_columns",
         ] + [
-            r["name"]
-            for r in conn.execute(
-                """
+            r["name"] for r in conn.execute("""
                     select name from sqlite_master
                     where name like "idx_%"
                     and type = "table"
-                """
-            )
+                """)
         ]
 
-    for t in tables.keys():
+    for t, table_info in tables.items():
         for hidden_table in hidden_tables:
             if t == hidden_table or t.startswith(hidden_table):
-                tables[t]["hidden"] = True
+                table_info["hidden"] = True
                 continue
 
     return tables

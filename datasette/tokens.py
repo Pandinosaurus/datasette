@@ -1,0 +1,214 @@
+"""
+Token handler system for Datasette.
+
+Provides a base class for token handlers and the default signed token handler.
+Plugins can implement register_token_handler to provide custom token backends
+(e.g. database-backed tokens that can be revoked and audited).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import time
+from typing import TYPE_CHECKING
+
+import itsdangerous
+
+if TYPE_CHECKING:
+    from datasette.app import Datasette
+
+
+class TokenInvalid(Exception):
+    """
+    Raised by a TokenHandler when a token it recognizes is invalid -
+    for example a bad signature, malformed payload or expired token.
+
+    Datasette responds to this with an HTTP 401 error. Handlers should
+    return None instead for tokens they do not recognize at all, so that
+    other registered handlers get a chance to verify them.
+    """
+
+    def __init__(self, message="Invalid token"):
+        self.message = message
+        super().__init__(message)
+
+
+@dataclasses.dataclass
+class TokenRestrictions:
+    """
+    Restrictions to apply to a token, limiting which actions it can perform.
+
+    Use the builder methods to construct restrictions::
+
+        restrictions = (TokenRestrictions()
+            .allow_all("view-instance")
+            .allow_database("mydb", "create-table")
+            .allow_resource("mydb", "mytable", "insert-row"))
+    """
+
+    all: list[str] = dataclasses.field(default_factory=list)
+    database: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    resource: dict[str, dict[str, list[str]]] = dataclasses.field(default_factory=dict)
+
+    def allow_all(self, action: str) -> TokenRestrictions:
+        """Allow an action across all databases and resources."""
+        self.all.append(action)
+        return self
+
+    def allow_database(self, database: str, action: str) -> TokenRestrictions:
+        """Allow an action on a specific database."""
+        self.database.setdefault(database, []).append(action)
+        return self
+
+    def allow_resource(
+        self, database: str, resource: str, action: str
+    ) -> TokenRestrictions:
+        """Allow an action on a specific resource within a database."""
+        self.resource.setdefault(database, {}).setdefault(resource, []).append(action)
+        return self
+
+    def abbreviated(self, datasette: Datasette) -> dict | None:
+        """
+        Return the abbreviated ``_r`` dictionary shape for this set of
+        restrictions, using action abbreviations registered with ``datasette``.
+        Returns ``None`` if no restrictions are set.
+        """
+        if not (self.all or self.database or self.resource):
+            return None
+
+        def abbreviate_action(action):
+            action_obj = datasette.actions.get(action)
+            if not action_obj:
+                return action
+            return action_obj.abbr or action
+
+        result: dict = {}
+        if self.all:
+            result["a"] = [abbreviate_action(a) for a in self.all]
+        if self.database:
+            result["d"] = {
+                database: [abbreviate_action(a) for a in actions]
+                for database, actions in self.database.items()
+            }
+        if self.resource:
+            result["r"] = {}
+            for database, resources in self.resource.items():
+                for resource, actions in resources.items():
+                    result["r"].setdefault(database, {})[resource] = [
+                        abbreviate_action(a) for a in actions
+                    ]
+        return result
+
+
+class TokenHandler:
+    """
+    Base class for token handlers.
+
+    Subclass this and implement create_token() and verify_token() to provide
+    a custom token backend. Return an instance from the register_token_handler hook.
+    """
+
+    name: str = ""
+
+    async def create_token(
+        self,
+        datasette: Datasette,
+        actor_id: str,
+        *,
+        expires_after: int | None = None,
+        restrictions: TokenRestrictions | None = None,
+    ) -> str:
+        """Create and return a token string for the given actor."""
+        raise NotImplementedError
+
+    async def verify_token(self, datasette: Datasette, token: str) -> dict | None:
+        """
+        Verify a token and return an actor dict.
+
+        Return None if this handler does not recognize the token at all,
+        so other handlers can try it. Raise TokenInvalid if the token is
+        recognized but invalid (bad signature, malformed, expired) - the
+        request will fail with a 401 error.
+        """
+        raise NotImplementedError
+
+
+class SignedTokenHandler(TokenHandler):
+    """
+    Default token handler using itsdangerous signed tokens (dstok_ prefix).
+    """
+
+    name = "signed"
+
+    async def create_token(
+        self,
+        datasette: Datasette,
+        actor_id: str,
+        *,
+        expires_after: int | None = None,
+        restrictions: TokenRestrictions | None = None,
+    ) -> str:
+        if not datasette.setting("allow_signed_tokens"):
+            raise ValueError(
+                "Signed tokens are not enabled for this Datasette instance"
+            )
+
+        token = {"a": actor_id, "t": int(time.time())}
+
+        if expires_after:
+            token["d"] = expires_after
+        if restrictions is not None:
+            abbreviated = restrictions.abbreviated(datasette)
+            if abbreviated is not None:
+                token["_r"] = abbreviated
+        return "dstok_{}".format(datasette.sign(token, namespace="token"))
+
+    async def verify_token(self, datasette: Datasette, token: str) -> dict | None:
+        prefix = "dstok_"
+
+        if not token.startswith(prefix):
+            # Not one of our tokens - leave it for other handlers
+            return None
+
+        if not datasette.setting("allow_signed_tokens"):
+            raise TokenInvalid(
+                "Signed tokens are not enabled for this Datasette instance"
+            )
+
+        max_signed_tokens_ttl = datasette.setting("max_signed_tokens_ttl")
+
+        raw = token[len(prefix) :]
+        try:
+            decoded = datasette.unsign(raw, namespace="token")
+        except itsdangerous.BadSignature:
+            raise TokenInvalid("Invalid token signature")
+
+        if "t" not in decoded:
+            raise TokenInvalid("Invalid token: no timestamp")
+        created = decoded["t"]
+        if not isinstance(created, int):
+            raise TokenInvalid("Invalid token: invalid timestamp")
+
+        duration = decoded.get("d")
+        if duration is not None and not isinstance(duration, int):
+            raise TokenInvalid("Invalid token: invalid duration")
+
+        if (duration is None and max_signed_tokens_ttl) or (
+            duration is not None
+            and max_signed_tokens_ttl
+            and duration > max_signed_tokens_ttl
+        ):
+            duration = max_signed_tokens_ttl
+
+        if duration and time.time() - created > duration:
+            raise TokenInvalid("Token has expired")
+
+        actor = {"id": decoded["a"], "token": "dstok"}
+
+        if "_r" in decoded:
+            actor["_r"] = decoded["_r"]
+
+        if duration:
+            actor["token_expires"] = created + duration
+
+        return actor

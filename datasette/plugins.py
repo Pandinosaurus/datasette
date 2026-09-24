@@ -1,27 +1,87 @@
 import importlib
-import pluggy
-import pkg_resources
+import importlib.metadata as importlib_metadata
+import importlib.resources as importlib_resources
+import os
 import sys
+from pprint import pprint
+
+import pluggy
+
 from . import hookspecs
 
 DEFAULT_PLUGINS = (
     "datasette.publish.heroku",
     "datasette.publish.cloudrun",
     "datasette.facets",
+    "datasette.filters",
     "datasette.sql_functions",
     "datasette.actor_auth_cookie",
     "datasette.default_permissions",
+    "datasette.default_permissions.tokens",
+    "datasette.default_permissions.sqlite_statistics",
+    "datasette.default_actions",
+    "datasette.default_column_types",
     "datasette.default_magic_parameters",
     "datasette.blob_renderer",
-    "datasette.default_menu_links",
+    "datasette.default_debug_menu",
+    "datasette.default_jump_items",
+    "datasette.default_database_actions",
+    "datasette.default_table_actions",
+    "datasette.default_query_actions",
+    "datasette.handle_exception",
+    "datasette.forbidden",
+    "datasette.events",
 )
 
 pm = pluggy.PluginManager("datasette")
 pm.add_hookspecs(hookspecs)
 
-if not hasattr(sys, "_called_from_test"):
+DATASETTE_TRACE_PLUGINS = os.environ.get("DATASETTE_TRACE_PLUGINS", None)
+
+
+def before(hook_name, hook_impls, kwargs):
+    print(file=sys.stderr)
+    print(f"{hook_name}:", file=sys.stderr)
+    pprint(kwargs, width=40, indent=4, stream=sys.stderr)
+    print("Hook implementations:", file=sys.stderr)
+    pprint(hook_impls, width=40, indent=4, stream=sys.stderr)
+
+
+def after(outcome, hook_name, hook_impls, kwargs):
+    results = outcome.get_result()
+    if not isinstance(results, list):
+        results = [results]
+    print("Results:", file=sys.stderr)
+    pprint(results, width=40, indent=4, stream=sys.stderr)
+
+
+if DATASETTE_TRACE_PLUGINS:
+    pm.add_hookcall_monitoring(before, after)
+
+
+DATASETTE_LOAD_PLUGINS = os.environ.get("DATASETTE_LOAD_PLUGINS", None)
+
+if not hasattr(sys, "_called_from_test") and DATASETTE_LOAD_PLUGINS is None:
     # Only load plugins if not running tests
     pm.load_setuptools_entrypoints("datasette")
+
+# Load any plugins specified in DATASETTE_LOAD_PLUGINS")
+if DATASETTE_LOAD_PLUGINS is not None:
+    for package_name in [
+        name for name in DATASETTE_LOAD_PLUGINS.split(",") if name.strip()
+    ]:
+        try:
+            distribution = importlib_metadata.distribution(package_name)
+            entry_points = distribution.entry_points
+            for entry_point in entry_points:
+                if entry_point.group == "datasette":
+                    mod = entry_point.load()
+                    pm.register(mod, name=entry_point.name)
+                    # Ensure name can be found in plugin_to_distinfo later:
+                    pm._plugin_distinfo.append((mod, distribution))
+        except importlib_metadata.PackageNotFoundError:
+            sys.stderr.write(f"Plugin {package_name} could not be found\n")
+
 
 # Load default plugins
 for plugin in DEFAULT_PLUGINS:
@@ -35,21 +95,24 @@ def get_plugins():
     for plugin in pm.get_plugins():
         static_path = None
         templates_path = None
-        if plugin.__name__ not in DEFAULT_PLUGINS:
+        plugin_name = (
+            plugin.__name__
+            if hasattr(plugin, "__name__")
+            else plugin.__class__.__name__
+        )
+        if plugin_name not in DEFAULT_PLUGINS:
             try:
-                if pkg_resources.resource_isdir(plugin.__name__, "static"):
-                    static_path = pkg_resources.resource_filename(
-                        plugin.__name__, "static"
+                if (importlib_resources.files(plugin_name) / "static").is_dir():
+                    static_path = str(importlib_resources.files(plugin_name) / "static")
+                if (importlib_resources.files(plugin_name) / "templates").is_dir():
+                    templates_path = str(
+                        importlib_resources.files(plugin_name) / "templates"
                     )
-                if pkg_resources.resource_isdir(plugin.__name__, "templates"):
-                    templates_path = pkg_resources.resource_filename(
-                        plugin.__name__, "templates"
-                    )
-            except (KeyError, ImportError):
-                # Caused by --plugins_dir= plugins - KeyError/ImportError thrown in Py3.5
+            except (TypeError, ModuleNotFoundError):
+                # Caused by --plugins_dir= plugins
                 pass
         plugin_info = {
-            "name": plugin.__name__,
+            "name": plugin_name,
             "static_path": static_path,
             "templates_path": templates_path,
             "hooks": [h.name for h in pm.get_hookcallers(plugin)],
@@ -57,6 +120,6 @@ def get_plugins():
         distinfo = plugin_to_distinfo.get(plugin)
         if distinfo:
             plugin_info["version"] = distinfo.version
-            plugin_info["name"] = distinfo.project_name
+            plugin_info["name"] = distinfo.name or distinfo.project_name
         plugins.append(plugin_info)
     return plugins

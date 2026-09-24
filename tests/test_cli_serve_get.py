@@ -1,8 +1,10 @@
-from datasette.cli import cli, serve
-from datasette.plugins import pm
-from click.testing import CliRunner
-import textwrap
 import json
+import textwrap
+
+from click.testing import CliRunner
+
+from datasette.cli import cli
+from datasette.plugins import pm
 
 
 def test_serve_with_get(tmp_path_factory):
@@ -16,9 +18,7 @@ def test_serve_with_get(tmp_path_factory):
         def startup(datasette):
             with open("{}", "w") as fp:
                 fp.write("hello")
-    """.format(
-                str(plugins_dir / "hello.txt")
-            ),
+    """.format(str(plugins_dir / "hello.txt")),
         ),
         "utf-8",
     )
@@ -31,28 +31,129 @@ def test_serve_with_get(tmp_path_factory):
             "--plugins-dir",
             str(plugins_dir),
             "--get",
-            "/_memory.json?sql=select+sqlite_version()",
+            "/_memory/-/query.json?sql=select+sqlite_version()",
         ],
     )
-    assert 0 == result.exit_code, result.output
-    assert {
-        "database": "_memory",
-        "truncated": False,
-        "columns": ["sqlite_version()"],
-    }.items() <= json.loads(result.output).items()
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    # Should have a single row with a single column
+    assert len(data["rows"]) == 1
+    assert list(data["rows"][0].keys()) == ["sqlite_version()"]
+    assert set(data.keys()) == {"rows", "ok", "truncated"}
 
     # The plugin should have created hello.txt
     assert (plugins_dir / "hello.txt").read_text() == "hello"
 
     # Annoyingly that new test plugin stays resident - we need
     # to manually unregister it to avoid conflict with other tests
-    to_unregister = [
+    to_unregister = next(
         p for p in pm.get_plugins() if p.__name__ == "init_for_serve_with_get.py"
-    ][0]
+    )
     pm.unregister(to_unregister)
 
 
-def test_serve_with_get_exit_code_for_error(tmp_path_factory):
+def test_serve_with_get_does_not_launch_background_tasks(tmp_path_factory):
+    # --get must never launch background tasks, even though its TestClient
+    # request
+    # flows through the full ASGI stack (including the AsgiRunOnFirstRequest
+    # fallback that would otherwise launch them). The plugin's startup hook
+    # itself still runs (registration happens) - only the launch is
+    # suppressed, so the sentinel file the background task would write must
+    # never appear.
+    plugins_dir = tmp_path_factory.mktemp("plugins_for_get_background_tasks")
+    sentinel = plugins_dir / "sentinel.txt"
+    (plugins_dir / "bg_task_for_get.py").write_text(
+        textwrap.dedent(
+            f"""
+        from datasette import hookimpl
+
+        @hookimpl
+        def startup(datasette):
+            async def inner():
+                async def task(datasette):
+                    with open("{sentinel!s}", "w") as fp:
+                        fp.write("ran")
+
+                datasette.add_background_task(task, name="get-sentinel-task")
+
+            return inner
+    """,
+        ),
+        "utf-8",
+    )
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--memory",
+            "--plugins-dir",
+            str(plugins_dir),
+            "--get",
+            "/_memory/-/query.json?sql=select+1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert not sentinel.exists()
+
+    to_unregister = next(
+        p for p in pm.get_plugins() if p.__name__ == "bg_task_for_get.py"
+    )
+    pm.unregister(to_unregister)
+
+
+def test_serve_with_get_headers():
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--memory",
+            "--get",
+            "/_memory/",
+            "--headers",
+        ],
+    )
+    # exit_code is 1 because it wasn't a 200 response
+    assert result.exit_code == 1, result.output
+    lines = result.output.splitlines()
+    assert lines and lines[0] == "HTTP/1.1 302"
+    assert "location: /_memory" in lines
+    assert "content-type: text/html; charset=utf-8" in lines
+
+
+def test_serve_with_get_and_token():
+    runner = CliRunner()
+    result1 = runner.invoke(
+        cli,
+        [
+            "create-token",
+            "--secret",
+            "sekrit",
+            "root",
+        ],
+    )
+    token = result1.output.strip()
+    result2 = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--secret",
+            "sekrit",
+            "--get",
+            "/-/actor.json",
+            "--token",
+            token,
+        ],
+    )
+    assert 0 == result2.exit_code, result2.output
+    assert json.loads(result2.output) == {
+        "ok": True,
+        "actor": {"id": "root", "token": "dstok"},
+    }
+
+
+def test_serve_with_get_exit_code_for_error():
     runner = CliRunner()
     result = runner.invoke(
         cli,
@@ -66,3 +167,27 @@ def test_serve_with_get_exit_code_for_error(tmp_path_factory):
     )
     assert result.exit_code == 1
     assert "404" in result.output
+
+
+def test_serve_get_actor():
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "serve",
+            "--memory",
+            "--get",
+            "/-/actor.json",
+            "--actor",
+            '{"id": "root", "extra": "x"}',
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {
+        "ok": True,
+        "actor": {
+            "id": "root",
+            "extra": "x",
+        },
+    }

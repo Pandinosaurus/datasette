@@ -1,8 +1,8 @@
-from datasette import hookimpl
-from datasette.utils import escape_fts
 import datetime
 import os
 import time
+
+from datasette import hookimpl
 
 
 def header(key, request):
@@ -25,9 +25,12 @@ def now(key, request):
     if key == "epoch":
         return int(time.time())
     elif key == "date_utc":
-        return datetime.datetime.utcnow().date().isoformat()
+        return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     elif key == "datetime_utc":
-        return datetime.datetime.utcnow().strftime(r"%Y-%m-%dT%H:%M:%S") + "Z"
+        return (
+            datetime.datetime.now(datetime.timezone.utc).strftime(r"%Y-%m-%dT%H:%M:%S")
+            + "Z"
+        )
     else:
         raise KeyError
 

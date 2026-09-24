@@ -1,11 +1,13 @@
 import json
+import pathlib
+
 import pytest
 
 from datasette.app import Datasette
-from datasette.cli import cli
+from datasette.utils import StartupError
 from datasette.utils.sqlite import sqlite3
+
 from .fixtures import TestClient as _TestClient
-from click.testing import CliRunner
 
 PLUGIN = """
 from datasette import hookimpl
@@ -17,8 +19,10 @@ def extra_template_vars():
     }
 """
 METADATA = {"title": "This is from metadata"}
-SETTINGS = {
-    "default_cache_ttl": 60,
+CONFIG = {
+    "settings": {
+        "default_cache_ttl": 60,
+    }
 }
 CSS = """
 body { margin-top: 3em}
@@ -26,9 +30,8 @@ body { margin-top: 3em}
 
 
 @pytest.fixture(scope="session")
-def config_dir_client(tmp_path_factory):
+def config_dir(tmp_path_factory):
     config_dir = tmp_path_factory.mktemp("config-dir")
-
     plugins_dir = config_dir / "plugins"
     plugins_dir.mkdir()
     (plugins_dir / "hooray.py").write_text(PLUGIN, "utf-8")
@@ -46,12 +49,11 @@ def config_dir_client(tmp_path_factory):
     (static_dir / "hello.css").write_text(CSS, "utf-8")
 
     (config_dir / "metadata.json").write_text(json.dumps(METADATA), "utf-8")
-    (config_dir / "settings.json").write_text(json.dumps(SETTINGS), "utf-8")
+    (config_dir / "datasette.json").write_text(json.dumps(CONFIG), "utf-8")
 
-    for dbname in ("demo.db", "immutable.db"):
+    for dbname in ("demo.db", "immutable.db", "j.sqlite3", "k.sqlite"):
         db = sqlite3.connect(str(config_dir / dbname))
-        db.executescript(
-            """
+        db.executescript("""
         CREATE TABLE cities (
             id integer primary key,
             name text
@@ -59,8 +61,8 @@ def config_dir_client(tmp_path_factory):
         INSERT INTO cities (id, name) VALUES
             (1, 'San Francisco')
         ;
-        """
-        )
+        """)
+        db.close()
 
     # Mark "immutable.db" as immutable
     (config_dir / "inspect-data.json").write_text(
@@ -76,15 +78,28 @@ def config_dir_client(tmp_path_factory):
         ),
         "utf-8",
     )
+    return config_dir
 
+
+def test_invalid_settings(config_dir):
+    previous = (config_dir / "datasette.json").read_text("utf-8")
+    (config_dir / "datasette.json").write_text(
+        json.dumps({"settings": {"invalid": "invalid-setting"}}), "utf-8"
+    )
+    try:
+        with pytest.raises(StartupError) as ex:
+            Datasette([], config_dir=config_dir)
+        assert ex.value.args[0] == "Invalid setting 'invalid' in config file"
+    finally:
+        (config_dir / "datasette.json").write_text(previous, "utf-8")
+
+
+@pytest.fixture(scope="session")
+def config_dir_client(config_dir):
     ds = Datasette([], config_dir=config_dir)
     yield _TestClient(ds)
-
-
-def test_metadata(config_dir_client):
-    response = config_dir_client.get("/-/metadata.json")
-    assert 200 == response.status
-    assert METADATA == response.json
+    for db in ds.databases.values():
+        db.close()
 
 
 def test_settings(config_dir_client):
@@ -93,21 +108,13 @@ def test_settings(config_dir_client):
     assert 60 == response.json["default_cache_ttl"]
 
 
-def test_error_on_config_json(tmp_path_factory):
-    config_dir = tmp_path_factory.mktemp("config-dir")
-    (config_dir / "config.json").write_text(json.dumps(SETTINGS), "utf-8")
-    runner = CliRunner(mix_stderr=False)
-    result = runner.invoke(cli, [str(config_dir), "--get", "/-/settings.json"])
-    assert result.exit_code == 1
-    assert "config.json should be renamed to settings.json" in result.stderr
-
-
 def test_plugins(config_dir_client):
     response = config_dir_client.get("/-/plugins.json")
     assert 200 == response.status
-    assert "hooray.py" in {p["name"] for p in response.json}
-    assert "non_py_file.txt" not in {p["name"] for p in response.json}
-    assert "mypy_cache" not in {p["name"] for p in response.json}
+    plugins = response.json
+    assert "hooray.py" in {p["name"] for p in plugins}
+    assert "non_py_file.txt" not in {p["name"] for p in plugins}
+    assert "mypy_cache" not in {p["name"] for p in plugins}
 
 
 def test_templates_and_plugin(config_dir_client):
@@ -132,21 +139,17 @@ def test_static_directory_browsing_not_allowed(config_dir_client):
 def test_databases(config_dir_client):
     response = config_dir_client.get("/-/databases.json")
     assert 200 == response.status
-    databases = response.json
-    assert 2 == len(databases)
+    databases = response.json["databases"]
+    assert 4 == len(databases)
     databases.sort(key=lambda d: d["name"])
-    assert "demo" == databases[0]["name"]
-    assert databases[0]["is_mutable"]
-    assert "immutable" == databases[1]["name"]
-    assert not databases[1]["is_mutable"]
+    for db, expected_name in zip(databases, ("demo", "immutable", "j", "k")):
+        assert expected_name == db["name"]
+        assert db["is_mutable"] == (expected_name != "immutable")
 
 
-@pytest.mark.parametrize("filename", ("metadata.yml", "metadata.yaml"))
-def test_metadata_yaml(tmp_path_factory, filename):
-    config_dir = tmp_path_factory.mktemp("yaml-config-dir")
-    (config_dir / filename).write_text("title: Title from metadata", "utf-8")
-    ds = Datasette([], config_dir=config_dir)
-    client = _TestClient(ds)
-    response = client.get("/-/metadata.json")
-    assert 200 == response.status
-    assert {"title": "Title from metadata"} == response.json
+def test_store_config_dir(config_dir_client):
+    ds = config_dir_client.ds
+
+    assert hasattr(ds, "config_dir")
+    assert ds.config_dir is not None
+    assert isinstance(ds.config_dir, pathlib.Path)

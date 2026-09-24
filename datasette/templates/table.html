@@ -1,11 +1,18 @@
 {% extends "base.html" %}
 
-{% block title %}{{ database }}: {{ table }}: {% if filtered_table_rows_count or filtered_table_rows_count == 0 %}{{ "{:,}".format(filtered_table_rows_count) }} row{% if filtered_table_rows_count == 1 %}{% else %}s{% endif %}{% endif %}
-    {% if human_description_en %}where {{ human_description_en }}{% endif %}{% endblock %}
+{% block title %}{{ database }}: {{ table }}: {% if count_truncated %}{{ "{:,}".format(count - 1) }}+ rows{% elif count or count == 0 %}{{ "{:,}".format(count) }} row{% if count == 1 %}{% else %}s{% endif %}{% endif %}{% if human_description_en %} {{ human_description_en }}{% endif %}{% endblock %}
 
 {% block extra_head %}
-{{ super() }}
-<script src="{{ urls.static('table.js') }}" defer></script>
+{{- super() -}}
+<script>window._datasetteTableData = {{ table_page_data|tojson }};</script>
+<script src="{{ static('column-chooser.js') }}" defer></script>
+{% if table_page_data.foreignKeys %}
+<script src="{{ static('autocomplete.js') }}" defer></script>
+{% endif %}
+<script src="{{ static('edit-tools.js') }}" defer></script>
+<script src="{{ static('table.js') }}" defer></script>
+<script src="{{ static('mobile-column-actions.js') }}" defer></script>
+<script>DATASETTE_ALLOW_FACET = {{ datasette_allow_facet }};</script>
 <style>
 @media only screen and (max-width: 576px) {
 {% for column in display_columns -%}
@@ -16,53 +23,45 @@
 
 {% block body_class %}table db-{{ database|to_css_class }} table-{{ table|to_css_class }}{% endblock %}
 
-{% block nav %}
-    <p class="crumbs">
-        <a href="{{ urls.instance() }}">home</a> /
-        <a href="{{ urls.database(database) }}">{{ database }}</a>
-    </p>
-    {{ super() }}
+{% block crumbs %}
+{{ crumbs.nav(request=request, database=database, table=table) }}
 {% endblock %}
 
 {% block content %}
-<div class="page-header" style="border-color: #{{ database_color(database) }}">
-    <h1>{{ metadata.title or table }}{% if is_view %} (view){% endif %}{% if private %} 🔒{% endif %}</h1>
-    {% set links = table_actions() %}{% if links %}
-    <details class="actions-menu-links">
-        <summary><svg aria-labelledby="actions-menu-links-title" role="img"
-                style="color: #666" xmlns="http://www.w3.org/2000/svg"
-                width="28" height="28" viewBox="0 0 24 24" fill="none"
-                stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <title id="actions-menu-links-title">Table actions</title>
-            <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-        </svg></summary>
-        <div class="dropdown-menu">
-            {% if links %}
-            <ul>
-                {% for link in links %}
-                <li><a href="{{ link.href }}">{{ link.label }}</a></li>
-                {% endfor %}
-            </ul>
-            {% endif %}
-        </div>
-    </details>{% endif %}
+<div class="page-header" style="border-color: #{{ database_color }}">
+    <h1>{{ metadata.get("title") or table }}{% if is_view %} (view){% endif %}{% if private %} 🔒{% endif %}</h1>
 </div>
+{% set action_links, action_title = actions(), "View actions" if is_view else "Table actions" %}
+{% include "_action_menu.html" %}
+
+{{ top_table() }}
 
 {% block description_source_license %}{% include "_description_source_license.html" %}{% endblock %}
 
-{% if filtered_table_rows_count or human_description_en %}
-    <h3>{% if filtered_table_rows_count or filtered_table_rows_count == 0 %}{{ "{:,}".format(filtered_table_rows_count) }} row{% if filtered_table_rows_count == 1 %}{% else %}s{% endif %}{% endif %}
-        {% if human_description_en %}{{ human_description_en }}{% endif %}
+{% if metadata.get("columns") %}
+<dl class="column-descriptions">
+    {% for column_name, column_description in metadata.columns.items() %}
+        <dt>{{ column_name }}</dt><dd>{{ column_description }}</dd>
+    {% endfor %}
+</dl>
+{% endif %}
+
+{% if count or human_description_en %}
+    <h3 class="table-summary">
+        {% if count_truncated %}<span class="table-count" aria-live="polite">{{ "{:,}".format(count - 1) }}+ rows</span>
+        <button type="button" class="count-all" data-count-url="{{ urls.table(database, table) }}/-/count">count all</button>
+        <span class="count-error" role="alert"></span>
+        {% elif count or count == 0 %}{{ "{:,}".format(count) }} row{% if count == 1 %}{% else %}s{% endif %}{% endif %}
+        {% if human_description_en %}<span class="table-summary-description">{{ human_description_en }}</span>{% endif %}
     </h3>
 {% endif %}
 
-<form class="filters" action="{{ urls.table(database, table) }}" method="get">
+<form class="core filters" action="{{ urls.table(database, table) }}" method="get">
     {% if supports_search %}
         <div class="search-row"><label for="_search">Search:</label><input id="_search" type="search" name="_search" value="{{ search }}"></div>
     {% endif %}
     {% for column, lookup, value in filters.selections() %}
-        <div class="filter-row">
+        <div class="filter-row filter-controls-row">
             <div class="select-wrapper">
                 <select name="_filter_column_{{ loop.index }}">
                     <option value="">- remove filter -</option>
@@ -79,7 +78,7 @@
             </div><input type="text" name="_filter_value_{{ loop.index }}" class="filter-value" value="{{ value }}">
         </div>
     {% endfor %}
-    <div class="filter-row">
+    <div class="filter-row filter-controls-row">
         <div class="select-wrapper">
             <select name="_filter_column">
                 <option value="">- column -</option>
@@ -90,14 +89,14 @@
         </div><div class="select-wrapper filter-op">
             <select name="_filter_op">
                 {% for key, display, no_argument in filters.lookups() %}
-                    <option value="{{ key }}{% if no_argument %}__1{% endif %}"{% if key == lookup %} selected{% endif %}>{{ display }}</option>
+                    <option value="{{ key }}{% if no_argument %}__1{% endif %}">{{ display }}</option>
                 {% endfor %}
             </select>
         </div><input type="text" name="_filter_value" class="filter-value">
     </div>
-    <div class="filter-row">
+    <div class="filter-row filter-actions-row">
         {% if is_sortable %}
-            <div class="select-wrapper small-screen-only">
+            <div class="select-wrapper">
                 <select name="_sort" id="sort_by">
                     <option value="">Sort...</option>
                     {% for column in display_columns %}
@@ -107,12 +106,12 @@
                     {% endfor %}
                 </select>
             </div>
-            <label class="sort_by_desc small-screen-only"><input type="checkbox" name="_sort_by_desc"{% if sort_desc %} checked{% endif %}> descending</label>
+            <label class="sort_by_desc"><input type="checkbox" name="_sort_by_desc" tabindex="0"{% if sort_desc %} checked{% endif %}> descending</label>
         {% endif %}
         {% for key, value in form_hidden_args %}
             <input type="hidden" name="{{ key }}" value="{{ value }}">
         {% endfor %}
-        <input type="submit" value="Apply">
+        <input type="submit" value="Apply filters" tabindex="0">
     </div>
 </form>
 
@@ -134,9 +133,7 @@
 <p class="export-links">This data as {% for name, url in renderers.items() %}<a href="{{ url }}">{{ name }}</a>{{ ", " if not loop.last }}{% endfor %}{% if display_rows %}, <a href="{{ url_csv }}">CSV</a> (<a href="#export">advanced</a>){% endif %}</p>
 
 {% if suggested_facets %}
-    <p class="suggested-facets">
-        Suggested facets: {% for facet in suggested_facets %}<a href="{{ facet.toggle_url }}#facet-{{ facet.name|to_css_class }}">{{ facet.name }}</a>{% if facet.type %} ({{ facet.type }}){% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
-    </p>
+    {% include "_suggested_facets.html" %}
 {% endif %}
 
 {% if facets_timed_out %}
@@ -144,30 +141,40 @@
 {% endif %}
 
 {% if facet_results %}
-    <div class="facet-results">
-        {% for facet_info in sorted_facet_results %}
-            <div class="facet-info facet-{{ database|to_css_class }}-{{ table|to_css_class }}-{{ facet_info.name|to_css_class }}" id="facet-{{ facet_info.name|to_css_class }}">
-                <p class="facet-info-name">
-                    <strong>{{ facet_info.name }}{% if facet_info.type != "column" %} ({{ facet_info.type }}){% endif %}</strong>
-                    {% if facet_info.hideable %}
-                        <a href="{{ facet_info.toggle_url }}" class="cross">&#x2716;</a>
-                    {% endif %}
-                </p>
-                <ul class="tight-bullets">
-                    {% for facet_value in facet_info.results %}
-                        {% if not facet_value.selected %}
-                            <li><a href="{{ facet_value.toggle_url }}">{{ (facet_value.label | string()) or "-" }}</a> {{ "{:,}".format(facet_value.count) }}</li>
-                        {% else %}
-                            <li>{{ facet_value.label or "-" }} &middot; {{ "{:,}".format(facet_value.count) }} <a href="{{ facet_value.toggle_url }}" class="cross">&#x2716;</a></li>
-                        {% endif %}
-                    {% endfor %}
-                    {% if facet_info.truncated %}
-                        <li>...</li>
-                    {% endif %}
-                </ul>
-            </div>
-        {% endfor %}
-    </div>
+    {% include "_facet_results.html" %}
+{% endif %}
+
+{% if all_columns %}
+<column-chooser></column-chooser>
+<button class="choose-columns-mobile small-screen-only" onclick="openColumnChooser()">Choose columns</button>
+<button type="button" class="column-actions-mobile small-screen-only">
+    <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+    </svg>
+    <span>Column actions</span>
+</button>
+<script>
+window._columnChooserData = {{ {"allColumns": all_columns, "selectedColumns": display_columns|map(attribute='name')|list, "primaryKeys": primary_keys}|tojson }};
+</script>
+{% endif %}
+{% if set_column_type_ui %}
+<script>
+window._setColumnTypeData = {{ set_column_type_ui|tojson }};
+</script>
+{% endif %}
+
+{% if table_insert_ui %}
+<div class="table-row-toolbar">
+    <button type="button" class="core table-insert-row" data-table-action="insert-row">
+        <svg class="row-inline-action-icon" aria-hidden="true" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect width="18" height="18" x="3" y="3" rx="2"></rect>
+            <path d="M8 12h8"></path>
+            <path d="M12 8v8"></path>
+        </svg>
+        <span>Insert row</span>
+    </button>
+</div>
 {% endif %}
 
 {% include custom_table_templates %}
@@ -186,12 +193,12 @@
                 <a href="{{ append_querystring(renderers['json'], '_shape=object') }}">object</a>
             {% endif %}
         </p>
-        <form action="{{ url_csv_path }}" method="get">
+        <form class="core" action="{{ url_csv_path }}" method="get">
             <p>
                 CSV options:
                 <label><input type="checkbox" name="_dl"> download file</label>
                 {% if expandable_columns %}<label><input type="checkbox" name="_labels" checked> expand labels</label>{% endif %}
-                {% if next_url and config.allow_csv_stream %}<label><input type="checkbox" name="_stream"> stream all rows</label>{% endif %}
+                {% if next_url and settings.allow_csv_stream %}<label><input type="checkbox" name="_stream"> stream all rows</label>{% endif %}
                 <input type="submit" value="Export CSV">
                 {% for key, value in url_csv_hidden_args %}
                     <input type="hidden" name="{{ key }}" value="{{ value }}">
@@ -207,6 +214,43 @@
 
 {% if view_definition %}
     <pre class="wrapped-sql">{{ view_definition }}</pre>
+{% endif %}
+
+{% if allow_execute_sql and query.sql %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const countLink = document.querySelector('a.count-sql');
+    if (countLink) {
+        countLink.addEventListener('click', async function(ev) {
+            ev.preventDefault();
+            // Replace countLink with span with same style attribute
+            const span = document.createElement('span');
+            span.textContent = 'counting...';
+            span.setAttribute('style', countLink.getAttribute('style'));
+            countLink.replaceWith(span);
+            countLink.setAttribute('disabled', 'disabled');
+            let url = countLink.href.replace(/(\?|$)/, '.json$1');
+            try {
+                const response = await fetch(url);
+                console.log({response});
+                const data = await response.json();
+                console.log({data});
+                if (!response.ok) {
+                    console.log('throw error');
+                    throw new Error(data.title || data.error);
+                }
+                const count = data['rows'][0]['count(*)'];
+                const formattedCount = count.toLocaleString();
+                span.closest('h3').textContent = formattedCount + ' rows';
+            } catch (error) {
+                console.log('Update', span, 'with error message', error);
+                span.textContent = error.message;
+                span.style.color = 'red';
+            }
+        });
+    }
+});
+</script>
 {% endif %}
 
 {% endblock %}

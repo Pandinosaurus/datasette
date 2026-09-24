@@ -1,64 +1,162 @@
 name: Deploy latest.datasette.io
 
 on:
+  workflow_dispatch:
   push:
     branches:
-      - main
+    - main
+    #   - 1.0-dev
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+    - name: Check deployment prerequisites
+      id: deployment-prerequisites
+      env:
+        GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        LATEST_DATASETTE_SECRET: ${{ secrets.LATEST_DATASETTE_SECRET }}
+      run: |
+        missing=()
+        for variable in GCP_SA_KEY LATEST_DATASETTE_SECRET; do
+          if [[ -z "${!variable:-}" ]]; then
+            missing+=("$variable")
+          fi
+        done
+        if (( ${#missing[@]} )); then
+          echo "::notice::Skipping deployment because required environment variables are missing: ${missing[*]}"
+          echo "available=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "available=true" >> "$GITHUB_OUTPUT"
+        fi
     - name: Check out datasette
-      uses: actions/checkout@v2
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      uses: actions/checkout@v7
     - name: Set up Python
-      uses: actions/setup-python@v2
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      uses: actions/setup-python@v6
       with:
-        python-version: 3.9
-    - uses: actions/cache@v2
-      name: Configure pip caching
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/setup.py') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
+        python-version: "3.13"
+        cache: pip
     - name: Install Python dependencies
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
       run: |
         python -m pip install --upgrade pip
-        python -m pip install -e .[test]
-        python -m pip install -e .[docs]
-        python -m pip install sphinx-to-sqlite==0.1a1
+        python -m pip install . --group dev
+        python -m pip install sphinx-to-sqlite==0.1a1 "s3-credentials>=0.17"
     - name: Run tests
-      run: pytest
-    - name: Build fixtures.db
-      run: python tests/fixtures.py fixtures.db fixtures.json plugins --extra-db-filename extra_database.db
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' && github.ref == 'refs/heads/main' }}
+      run: |
+        pytest -n auto -m "not serial"
+        pytest -m "serial"
+    - name: Build fixtures.db and other files needed to deploy the demo
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      run: |-
+        python tests/fixtures.py \
+          fixtures.db \
+          fixtures-config.json \
+          fixtures-metadata.json \
+          plugins \
+          --extra-db-filename extra_database.db
+        # Package the config with the plugins, excluding test-only plugin secrets
+        # that reference temporary files outside the deployed container.
+        jq 'del(.plugins)' fixtures-config.json > plugins/fixtures-config.json
     - name: Build docs.db
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' && github.ref == 'refs/heads/main' }}
       run: |-
         cd docs
-        sphinx-build -b xml . _build
+        DISABLE_SPHINX_INLINE_TABS=1 sphinx-build -b xml . _build
         sphinx-to-sqlite ../docs.db _build
         cd ..
-    - name: Set up Cloud Run
-      uses: google-github-actions/setup-gcloud@master
+    - name: Set up the alternate-route demo
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      run: |
+        echo '
+        from datasette import hookimpl
+
+        @hookimpl
+        def startup(datasette):
+            db = datasette.get_database("fixtures2")
+            db.route = "alternative-route"
+        ' > plugins/alternative_route.py
+        cp fixtures.db fixtures2.db
+    - name: And the counters writable stored query demo
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      run: |
+        cat > plugins/counters.py <<EOF
+        from datasette import hookimpl
+        @hookimpl
+        def startup(datasette):
+            db = datasette.add_memory_database("counters")
+            async def inner():
+                await db.execute_write("create table if not exists counters (name text primary key, value integer)")
+                await db.execute_write("insert or ignore into counters (name, value) values ('counter_a', 0)")
+                await db.execute_write("insert or ignore into counters (name, value) values ('counter_b', 0)")
+                await db.execute_write("insert or ignore into counters (name, value) values ('counter_c', 0)")
+                for name in ("counter_a", "counter_b", "counter_c"):
+                    await datasette.add_query(
+                        "counters",
+                        "increment_{}".format(name),
+                        "update counters set value = value + 1 where name = '{}'".format(name),
+                        on_success_message_sql="select 'Counter {name} incremented to ' || value from counters where name = '{name}'".format(name=name),
+                        is_write=True,
+                        is_trusted=True,
+                    )
+                    await datasette.add_query(
+                        "counters",
+                        "decrement_{}".format(name),
+                        "update counters set value = value - 1 where name = '{}'".format(name),
+                        on_success_message_sql="select 'Counter {name} decremented to ' || value from counters where name = '{name}'".format(name=name),
+                        is_write=True,
+                        is_trusted=True,
+                    )
+            return inner
+        EOF
+    # - name: Make some modifications to metadata.json
+    #   run: |
+    #     cat fixtures.json | \
+    #       jq '.databases |= . + {"ephemeral": {"allow": {"id": "*"}}}' | \
+    #       jq '.plugins |= . + {"datasette-ephemeral-tables": {"table_ttl": 900}}' \
+    #       > metadata.json
+    #     cat metadata.json
+    - id: auth
+      name: Authenticate to Google Cloud
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      uses: google-github-actions/auth@v3
       with:
-        version: '275.0.0'
-        service_account_email: ${{ secrets.GCP_SA_EMAIL }}
-        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+    - name: Set up Cloud SDK
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      uses: google-github-actions/setup-gcloud@v3
     - name: Deploy to Cloud Run
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' }}
+      env:
+        LATEST_DATASETTE_SECRET: ${{ secrets.LATEST_DATASETTE_SECRET }}
       run: |-
         gcloud config set run/region us-central1
         gcloud config set project datasette-222320
-        datasette publish cloudrun fixtures.db extra_database.db \
-            -m fixtures.json \
+        export SUFFIX="-${GITHUB_REF#refs/heads/}"
+        export SUFFIX=${SUFFIX#-main}
+        # Replace 1.0 with one-dot-zero in SUFFIX
+        export SUFFIX=${SUFFIX//1.0/one-dot-zero}
+        datasette publish cloudrun fixtures.db fixtures2.db extra_database.db \
+            -m fixtures-metadata.json \
             --plugins-dir=plugins \
             --branch=$GITHUB_SHA \
             --version-note=$GITHUB_SHA \
-            --extra-options="--setting template_debug 1 --crossdb" \
-            --install=pysqlite3-binary \
-            --service=datasette-latest
-        # Deploy docs.db to a different service
-        datasette publish cloudrun docs.db \
-            --branch=$GITHUB_SHA \
-            --version-note=$GITHUB_SHA \
-            --extra-options="--setting template_debug 1" \
-            --service=datasette-docs-latest
+            --extra-options="--config plugins/fixtures-config.json --setting template_debug 1 --setting trace_debug 1 --crossdb --root" \
+            --install 'datasette-ephemeral-tables>=0.2.2' \
+            --service "datasette-latest$SUFFIX" \
+            --secret $LATEST_DATASETTE_SECRET
+    - name: Upload latest documentation database to S3 (only for main)
+      if: ${{ steps.deployment-prerequisites.outputs.available == 'true' && github.ref == 'refs/heads/main' }}
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.S3_DATASETTE_DOCS_ACCESS_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_DATASETTE_DOCS_SECRET_KEY }}
+      run: |-
+        # Keep development documentation separate from the stable release database.
+        s3-credentials put-object datasette-docs latest/docs.db docs.db \
+          --content-type application/octet-stream

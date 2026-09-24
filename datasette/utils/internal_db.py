@@ -1,39 +1,53 @@
 import textwrap
 
+from sqlite_utils import Database as SQLiteUtilsDatabase
+from sqlite_utils import Migrations
 
-async def init_internal_db(db):
-    await db.execute_write(
-        textwrap.dedent(
-            """
-    CREATE TABLE databases (
+from datasette.utils import escape_sqlite, table_column_details
+
+INTERNAL_DB_SCHEMA_TABLES = {
+    "catalog_databases",
+    "catalog_tables",
+    "catalog_views",
+    "catalog_columns",
+    "catalog_indexes",
+    "catalog_foreign_keys",
+    "metadata_instance",
+    "metadata_databases",
+    "metadata_resources",
+    "metadata_columns",
+    "column_types",
+    "queries",
+}
+
+INTERNAL_DB_SCHEMA_INDEXES = {
+    "queries_owner_idx",
+}
+
+INTERNAL_DB_SCHEMA_SQL = textwrap.dedent("""
+    CREATE TABLE IF NOT EXISTS catalog_databases (
         database_name TEXT PRIMARY KEY,
         path TEXT,
         is_memory INTEGER,
         schema_version INTEGER
-    )
-    """
-        ),
-        block=True,
-    )
-    await db.execute_write(
-        textwrap.dedent(
-            """
-    CREATE TABLE tables (
+    );
+    CREATE TABLE IF NOT EXISTS catalog_tables (
         database_name TEXT,
         table_name TEXT,
         rootpage INTEGER,
         sql TEXT,
         PRIMARY KEY (database_name, table_name),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name)
-    )
-    """
-        ),
-        block=True,
-    )
-    await db.execute_write(
-        textwrap.dedent(
-            """
-    CREATE TABLE columns (
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name)
+    );
+    CREATE TABLE IF NOT EXISTS catalog_views (
+        database_name TEXT,
+        view_name TEXT,
+        rootpage INTEGER,
+        sql TEXT,
+        PRIMARY KEY (database_name, view_name),
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name)
+    );
+    CREATE TABLE IF NOT EXISTS catalog_columns (
         database_name TEXT,
         table_name TEXT,
         cid INTEGER,
@@ -44,17 +58,10 @@ async def init_internal_db(db):
         is_pk INTEGER, -- renamed from pk
         hidden INTEGER,
         PRIMARY KEY (database_name, table_name, name),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name),
-        FOREIGN KEY (database_name, table_name) REFERENCES tables(database_name, table_name)
-    )
-    """
-        ),
-        block=True,
-    )
-    await db.execute_write(
-        textwrap.dedent(
-            """
-    CREATE TABLE indexes (
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name),
+        FOREIGN KEY (database_name, table_name) REFERENCES catalog_tables(database_name, table_name)
+    );
+    CREATE TABLE IF NOT EXISTS catalog_indexes (
         database_name TEXT,
         table_name TEXT,
         seq INTEGER,
@@ -63,17 +70,10 @@ async def init_internal_db(db):
         origin TEXT,
         partial INTEGER,
         PRIMARY KEY (database_name, table_name, name),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name),
-        FOREIGN KEY (database_name, table_name) REFERENCES tables(database_name, table_name)
-    )
-    """
-        ),
-        block=True,
-    )
-    await db.execute_write(
-        textwrap.dedent(
-            """
-    CREATE TABLE foreign_keys (
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name),
+        FOREIGN KEY (database_name, table_name) REFERENCES catalog_tables(database_name, table_name)
+    );
+    CREATE TABLE IF NOT EXISTS catalog_foreign_keys (
         database_name TEXT,
         table_name TEXT,
         id INTEGER,
@@ -85,99 +85,242 @@ async def init_internal_db(db):
         on_delete TEXT,
         match TEXT,
         PRIMARY KEY (database_name, table_name, id, seq),
-        FOREIGN KEY (database_name) REFERENCES databases(database_name),
-        FOREIGN KEY (database_name, table_name) REFERENCES tables(database_name, table_name)
-    )
-    """
-        ),
-        block=True,
-    )
+        FOREIGN KEY (database_name) REFERENCES catalog_databases(database_name),
+        FOREIGN KEY (database_name, table_name) REFERENCES catalog_tables(database_name, table_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS metadata_instance (
+        key text,
+        value text,
+        unique(key)
+    );
+
+    CREATE TABLE IF NOT EXISTS metadata_databases (
+        database_name text,
+        key text,
+        value text,
+        unique(database_name, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS metadata_resources (
+        database_name text,
+        resource_name text,
+        key text,
+        value text,
+        unique(database_name, resource_name, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS metadata_columns (
+        database_name text,
+        resource_name text,
+        column_name text,
+        key text,
+        value text,
+        unique(database_name, resource_name, column_name, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS column_types (
+        database_name TEXT NOT NULL,
+        resource_name TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        column_type TEXT NOT NULL,
+        config TEXT,
+        PRIMARY KEY (database_name, resource_name, column_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS queries (
+        database_name TEXT NOT NULL,
+        name TEXT NOT NULL,
+        sql TEXT NOT NULL,
+        title TEXT,
+        description TEXT,
+        description_html TEXT,
+        options TEXT NOT NULL DEFAULT '{}',
+        parameters TEXT NOT NULL DEFAULT '[]',
+        is_write INTEGER NOT NULL DEFAULT 0 CHECK (is_write IN (0, 1)),
+        is_private INTEGER NOT NULL DEFAULT 0 CHECK (is_private IN (0, 1)),
+        is_trusted INTEGER NOT NULL DEFAULT 0 CHECK (is_trusted IN (0, 1)),
+        source TEXT NOT NULL DEFAULT 'user',
+        owner_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (database_name, name)
+    );
+
+    CREATE INDEX IF NOT EXISTS queries_owner_idx
+        ON queries(owner_id);
+    """).strip()
 
 
-async def populate_schema_tables(internal_db, db):
+internal_migrations = Migrations("datasette_internal")
+
+
+def _internal_schema_exists(db):
+    table_names = set(db.table_names())
+    if not INTERNAL_DB_SCHEMA_TABLES.issubset(table_names):
+        return False
+    index_names = {
+        row[0]
+        for row in db.execute("select name from sqlite_master where type = 'index'")
+    }
+    return INTERNAL_DB_SCHEMA_INDEXES.issubset(index_names)
+
+
+@internal_migrations(name="0001_initial")
+def initial_internal_schema(db):
+    if _internal_schema_exists(db):
+        return
+    db.executescript(INTERNAL_DB_SCHEMA_SQL)
+
+
+async def init_internal_db(db):
+    def apply_migrations(conn):
+        internal_migrations.apply(SQLiteUtilsDatabase(conn, execute_plugins=False))
+
+    await db.execute_write_fn(apply_migrations, transaction=False)
+
+
+async def populate_schema_tables(internal_db, db, schema_version):
     database_name = db.name
-    await internal_db.execute_write(
-        "DELETE FROM tables WHERE database_name = ?", [database_name], block=True
-    )
+
     tables = (await db.execute("select * from sqlite_master WHERE type = 'table'")).rows
-    for table in tables:
-        table_name = table["name"]
-        await internal_db.execute_write(
+    views = (await db.execute("select * from sqlite_master WHERE type = 'view'")).rows
+
+    def collect_info(conn):
+        tables_to_insert = []
+        views_to_insert = []
+        columns_to_insert = []
+        foreign_keys_to_insert = []
+        indexes_to_insert = []
+
+        for view in views:
+            view_name = view["name"]
+            views_to_insert.append(
+                (database_name, view_name, view["rootpage"], view["sql"])
+            )
+
+        for table in tables:
+            table_name = table["name"]
+            tables_to_insert.append(
+                (database_name, table_name, table["rootpage"], table["sql"])
+            )
+            columns = table_column_details(conn, table_name)
+            columns_to_insert.extend(
+                {
+                    "database_name": database_name,
+                    "table_name": table_name,
+                    **column._asdict(),
+                }
+                for column in columns
+            )
+            foreign_keys = conn.execute(
+                f"PRAGMA foreign_key_list({escape_sqlite(table_name)})"
+            ).fetchall()
+            foreign_keys_to_insert.extend(
+                {
+                    "database_name": database_name,
+                    "table_name": table_name,
+                    **dict(foreign_key),
+                }
+                for foreign_key in foreign_keys
+            )
+            indexes = conn.execute(
+                f"PRAGMA index_list({escape_sqlite(table_name)})"
+            ).fetchall()
+            indexes_to_insert.extend(
+                {
+                    "database_name": database_name,
+                    "table_name": table_name,
+                    **dict(index),
+                }
+                for index in indexes
+            )
+        return (
+            tables_to_insert,
+            views_to_insert,
+            columns_to_insert,
+            foreign_keys_to_insert,
+            indexes_to_insert,
+        )
+
+    (
+        tables_to_insert,
+        views_to_insert,
+        columns_to_insert,
+        foreign_keys_to_insert,
+        indexes_to_insert,
+    ) = await db.execute_fn(collect_info)
+
+    def replace_catalog(conn):
+        # Delete child rows before their catalog_tables parents so this also
+        # works if a prepare_connection plugin enables foreign key enforcement.
+        for table in (
+            "catalog_columns",
+            "catalog_foreign_keys",
+            "catalog_indexes",
+            "catalog_views",
+            "catalog_tables",
+        ):
+            conn.execute(
+                f"DELETE FROM {table} WHERE database_name = ?",
+                [database_name],
+            )
+        conn.execute(
             """
-            INSERT INTO tables (database_name, table_name, rootpage, sql)
+            INSERT OR REPLACE INTO catalog_databases (
+                database_name, path, is_memory, schema_version
+            ) VALUES (?, ?, ?, ?)
+            """,
+            [
+                database_name,
+                str(db.path) if db.path is not None else None,
+                db.is_memory,
+                schema_version,
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO catalog_tables (database_name, table_name, rootpage, sql)
             values (?, ?, ?, ?)
-        """,
-            [database_name, table_name, table["rootpage"], table["sql"]],
-            block=True,
-        )
-        # And the columns
-        await internal_db.execute_write(
-            "DELETE FROM columns WHERE database_name = ? and table_name = ?",
-            [database_name, table_name],
-            block=True,
-        )
-        columns = await db.table_column_details(table_name)
-        for column in columns:
-            params = {
-                **{"database_name": database_name, "table_name": table_name},
-                **column._asdict(),
-            }
-            await internal_db.execute_write(
-                """
-                INSERT INTO columns (
-                    database_name, table_name, cid, name, type, "notnull", default_value, is_pk, hidden
-                ) VALUES (
-                    :database_name, :table_name, :cid, :name, :type, :notnull, :default_value, :is_pk, :hidden
-                )
             """,
-                params,
-                block=True,
-            )
-        # And the foreign_keys
-        await internal_db.execute_write(
-            "DELETE FROM foreign_keys WHERE database_name = ? and table_name = ?",
-            [database_name, table_name],
-            block=True,
+            tables_to_insert,
         )
-        foreign_keys = (
-            await db.execute(f"PRAGMA foreign_key_list([{table_name}])")
-        ).rows
-        for foreign_key in foreign_keys:
-            params = {
-                **{"database_name": database_name, "table_name": table_name},
-                **dict(foreign_key),
-            }
-            await internal_db.execute_write(
-                """
-                INSERT INTO foreign_keys (
-                    database_name, table_name, "id", seq, "table", "from", "to", on_update, on_delete, match
-                ) VALUES (
-                    :database_name, :table_name, :id, :seq, :table, :from, :to, :on_update, :on_delete, :match
-                )
+        conn.executemany(
+            """
+            INSERT INTO catalog_views (database_name, view_name, rootpage, sql)
+            values (?, ?, ?, ?)
             """,
-                params,
-                block=True,
-            )
-        # And the indexes
-        await internal_db.execute_write(
-            "DELETE FROM indexes WHERE database_name = ? and table_name = ?",
-            [database_name, table_name],
-            block=True,
+            views_to_insert,
         )
-        indexes = (await db.execute(f"PRAGMA index_list([{table_name}])")).rows
-        for index in indexes:
-            params = {
-                **{"database_name": database_name, "table_name": table_name},
-                **dict(index),
-            }
-            await internal_db.execute_write(
-                """
-                INSERT INTO indexes (
-                    database_name, table_name, seq, name, "unique", origin, partial
-                ) VALUES (
-                    :database_name, :table_name, :seq, :name, :unique, :origin, :partial
-                )
-            """,
-                params,
-                block=True,
+        conn.executemany(
+            """
+            INSERT INTO catalog_columns (
+                database_name, table_name, cid, name, type, "notnull", default_value, is_pk, hidden
+            ) VALUES (
+                :database_name, :table_name, :cid, :name, :type, :notnull, :default_value, :is_pk, :hidden
             )
+            """,
+            columns_to_insert,
+        )
+        conn.executemany(
+            """
+            INSERT INTO catalog_foreign_keys (
+                database_name, table_name, "id", seq, "table", "from", "to", on_update, on_delete, match
+            ) VALUES (
+                :database_name, :table_name, :id, :seq, :table, :from, :to, :on_update, :on_delete, :match
+            )
+            """,
+            foreign_keys_to_insert,
+        )
+        conn.executemany(
+            """
+            INSERT INTO catalog_indexes (
+                database_name, table_name, seq, name, "unique", origin, partial
+            ) VALUES (
+                :database_name, :table_name, :seq, :name, :unique, :origin, :partial
+            )
+            """,
+            indexes_to_insert,
+        )
+
+    await internal_db.execute_write_fn(replace_catalog)

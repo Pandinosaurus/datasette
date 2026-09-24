@@ -1,17 +1,21 @@
-from contextlib import contextmanager
-from datasette import hookimpl
-import click
 import json
 import os
+import pathlib
 import shlex
-from subprocess import call, check_output
+import shutil
 import tempfile
+from contextlib import contextmanager
+from subprocess import call, check_output
+
+import click
+
+from datasette import hookimpl
+from datasette.utils import link_or_copy, link_or_copy_directory, parse_metadata
 
 from .common import (
     add_common_publish_arguments_and_options,
     fail_if_publish_binary_not_installed,
 )
-from datasette.utils import link_or_copy, link_or_copy_directory, parse_metadata
 
 
 @hookimpl
@@ -27,6 +31,11 @@ def publish_subcommand(publish):
     @click.option(
         "--tar",
         help="--tar option to pass to Heroku, e.g. --tar=/usr/local/bin/gtar",
+    )
+    @click.option(
+        "--generate-dir",
+        type=click.Path(dir_okay=True, file_okay=False),
+        help="Output generated application files and stop without deploying",
     )
     def heroku(
         files,
@@ -49,7 +58,9 @@ def publish_subcommand(publish):
         about_url,
         name,
         tar,
+        generate_dir,
     ):
+        "Publish databases to Datasette running on Heroku"
         fail_if_publish_binary_not_installed(
             "heroku", "Heroku", "https://cli.heroku.com"
         )
@@ -104,6 +115,16 @@ def publish_subcommand(publish):
             secret,
             extra_metadata,
         ):
+            if generate_dir:
+                # Recursively copy files from current working directory to it
+                if pathlib.Path(generate_dir).exists():
+                    raise click.ClickException("Directory already exists")
+                shutil.copytree(".", generate_dir)
+                click.echo(
+                    f"Generated files written to {generate_dir}, stopping without deploying",
+                    err=True,
+                )
+                return
             app_name = None
             if name:
                 # Check to see if this app already exists
@@ -175,7 +196,7 @@ def temporary_heroku_directory(
                 fp.write(json.dumps(metadata_content, indent=2))
 
         with open("runtime.txt", "w") as fp:
-            fp.write("python-3.8.7")
+            fp.write("python-3.11.0")
 
         if branch:
             install = [
@@ -215,7 +236,7 @@ def temporary_heroku_directory(
             extras.extend(["--static", f"{mount_point}:{mount_point}"])
 
         quoted_files = " ".join(
-            ["-i {}".format(shlex.quote(file_name)) for file_name in file_names]
+            [f"-i {shlex.quote(file_name)}" for file_name in file_names]
         )
         procfile_cmd = "web: datasette serve --host 0.0.0.0 {quoted_files} --cors --port $PORT --inspect-file inspect-data.json {extras}".format(
             quoted_files=quoted_files, extras=" ".join(extras)

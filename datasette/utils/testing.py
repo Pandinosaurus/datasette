@@ -1,9 +1,10 @@
-from asgiref.sync import async_to_sync
-from urllib.parse import urlencode
 import json
+from urllib.parse import urlencode
+
+from asgiref.sync import async_to_sync
 
 # These wrapper classes pre-date the introduction of
-# datasette.client and httpx to Datasette. They could
+# datasette.client and httpx2 to Datasette. They could
 # be removed if the Datasette tests are modified to
 # call datasette.client directly.
 
@@ -16,6 +17,11 @@ class TestResponse:
     def status(self):
         return self.httpx_response.status_code
 
+    # Supports both for test-writing convenience
+    @property
+    def status_code(self):
+        return self.status
+
     @property
     def headers(self):
         return self.httpx_response.headers
@@ -25,15 +31,12 @@ class TestResponse:
         return self.httpx_response.content
 
     @property
+    def content(self):
+        return self.body
+
+    @property
     def cookies(self):
         return dict(self.httpx_response.cookies)
-
-    def cookie_was_deleted(self, cookie):
-        return any(
-            h
-            for h in self.httpx_response.headers.get_list("set-cookie")
-            if h.startswith(f'{cookie}="";')
-        )
 
     @property
     def json(self):
@@ -55,10 +58,26 @@ class TestClient:
 
     @async_to_sync
     async def get(
-        self, path, allow_redirects=True, redirect_count=0, method="GET", cookies=None
+        self,
+        path,
+        follow_redirects=False,
+        redirect_count=0,
+        method="GET",
+        params=None,
+        cookies=None,
+        if_none_match=None,
+        headers=None,
     ):
+        if params:
+            path += "?" + urlencode(params, doseq=True)
         return await self._request(
-            path, allow_redirects, redirect_count, method, cookies
+            path=path,
+            follow_redirects=follow_redirects,
+            redirect_count=redirect_count,
+            method=method,
+            cookies=cookies,
+            if_none_match=if_none_match,
+            headers=headers,
         )
 
     @async_to_sync
@@ -67,7 +86,7 @@ class TestClient:
         path,
         post_data=None,
         body=None,
-        allow_redirects=True,
+        follow_redirects=False,
         redirect_count=0,
         content_type="application/x-www-form-urlencoded",
         cookies=None,
@@ -77,20 +96,13 @@ class TestClient:
         cookies = cookies or {}
         post_data = post_data or {}
         assert not (post_data and body), "Provide one or other of body= or post_data="
-        # Maybe fetch a csrftoken first
-        if csrftoken_from is not None:
-            assert body is None, "body= is not compatible with csrftoken_from="
-            if csrftoken_from is True:
-                csrftoken_from = path
-            token_response = await self._request(csrftoken_from, cookies=cookies)
-            csrftoken = token_response.cookies["ds_csrftoken"]
-            cookies["ds_csrftoken"] = csrftoken
-            post_data["csrftoken"] = csrftoken
+        # csrftoken_from is accepted for backward compatibility but is now a no-op.
+        # Datasette no longer uses CSRF tokens - see CrossOriginProtectionMiddleware.
         if post_data:
             body = urlencode(post_data, doseq=True)
         return await self._request(
             path=path,
-            allow_redirects=allow_redirects,
+            follow_redirects=follow_redirects,
             redirect_count=redirect_count,
             method="POST",
             cookies=cookies,
@@ -103,54 +115,61 @@ class TestClient:
     async def request(
         self,
         path,
-        allow_redirects=True,
+        follow_redirects=True,
         redirect_count=0,
         method="GET",
         cookies=None,
         headers=None,
         post_body=None,
         content_type=None,
+        if_none_match=None,
     ):
         return await self._request(
             path,
-            allow_redirects=allow_redirects,
+            follow_redirects=follow_redirects,
             redirect_count=redirect_count,
             method=method,
             cookies=cookies,
             headers=headers,
             post_body=post_body,
             content_type=content_type,
+            if_none_match=if_none_match,
         )
 
     async def _request(
         self,
         path,
-        allow_redirects=True,
+        follow_redirects=True,
         redirect_count=0,
         method="GET",
         cookies=None,
         headers=None,
         post_body=None,
         content_type=None,
+        if_none_match=None,
     ):
+        await self.ds.invoke_startup()
         headers = headers or {}
         if content_type:
             headers["content-type"] = content_type
+        if if_none_match:
+            headers["if-none-match"] = if_none_match
         httpx_response = await self.ds.client.request(
             method,
             path,
-            allow_redirects=allow_redirects,
+            follow_redirects=follow_redirects,
+            avoid_path_rewrites=True,
             cookies=cookies,
             headers=headers,
             content=post_body,
         )
         response = TestResponse(httpx_response)
-        if allow_redirects and response.status in (301, 302):
+        if follow_redirects and response.status in (301, 302):
             assert (
                 redirect_count < self.max_redirects
             ), f"Redirected {redirect_count} times, max_redirects={self.max_redirects}"
             location = response.headers["Location"]
             return await self._request(
-                location, allow_redirects=True, redirect_count=redirect_count + 1
+                location, follow_redirects=True, redirect_count=redirect_count + 1
             )
         return response
